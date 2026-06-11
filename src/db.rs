@@ -70,6 +70,36 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // Create FTS table with Porter stemming, or migrate from old schema
     migrate_fts(conn)?;
 
+    // Create embeddings table for semantic search
+    init_embeddings(conn)?;
+
+    // Create category tables for wiki generation
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            parent_id INTEGER,
+            description TEXT,
+            document_count INTEGER DEFAULT 0,
+            FOREIGN KEY (parent_id) REFERENCES categories(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);
+
+        CREATE TABLE IF NOT EXISTS message_categories (
+            message_id INTEGER,
+            category_id INTEGER,
+            confidence REAL,
+            PRIMARY KEY (message_id, category_id),
+            FOREIGN KEY (message_id) REFERENCES messages(id),
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_msgcat_category ON message_categories(category_id);
+        ",
+    )?;
+
     conn.execute_batch(
         "
         CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
@@ -599,6 +629,201 @@ pub fn verify(conn: &Connection) -> Result<()> {
     }
     println!("\nAll checks passed.");
     Ok(())
+}
+
+/// Initialize embeddings table for semantic search
+fn init_embeddings(conn: &Connection) -> Result<()> {
+    let embeddings_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings')",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if !embeddings_exists {
+        conn.execute_batch(
+            "
+            CREATE TABLE embeddings (
+                message_id INTEGER PRIMARY KEY,
+                embedding TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX idx_embeddings_message ON embeddings(message_id);
+            ",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Store embedding for a message
+#[allow(dead_code)]
+pub fn store_embedding(conn: &Connection, message_id: i64, embedding: &[f32]) -> Result<()> {
+    let embedding_json = serde_json::to_string(embedding)?;
+    conn.execute(
+        "INSERT INTO embeddings (message_id, embedding) VALUES (?1, ?2)
+         ON CONFLICT(message_id) DO UPDATE SET embedding = excluded.embedding",
+        params![message_id, embedding_json],
+    )?;
+    Ok(())
+}
+
+/// Get embedding for a message
+#[allow(dead_code)]
+pub fn get_embedding(conn: &Connection, message_id: i64) -> Result<Option<Vec<f32>>> {
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT embedding FROM embeddings WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match result {
+        Some(json) => {
+            let vec: Vec<f32> = serde_json::from_str(&json)?;
+            Ok(Some(vec))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Cosine similarity between two vectors
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
+}
+
+/// Result from semantic search
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SemanticSearchResult {
+    pub message_id: i64,
+    pub session_id: String,
+    pub project: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub score: f32,
+}
+
+/// Semantic search using embeddings
+/// Returns messages similar to the query embedding, sorted by similarity
+#[allow(dead_code)]
+pub fn semantic_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+    project_filter: Option<&str>,
+    role_filter: Option<&str>,
+) -> Result<Vec<SemanticSearchResult>> {
+    // Get all messages that have embeddings
+    let sql = if project_filter.is_some() {
+        "SELECT m.id, m.session_id, s.project, m.role, m.content, m.timestamp, e.embedding
+         FROM messages m
+         JOIN sessions s ON s.session_id = m.session_id
+         JOIN embeddings e ON e.message_id = m.id
+         WHERE s.project LIKE ?1"
+    } else {
+        "SELECT m.id, m.session_id, s.project, m.role, m.content, m.timestamp, e.embedding
+         FROM messages m
+         JOIN sessions s ON s.session_id = m.session_id
+         JOIN embeddings e ON e.message_id = m.id"
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows: Vec<(i64, String, String, String, String, Option<String>, String)> =
+        if let Some(proj) = project_filter {
+            let normalized = format!("%{}%", proj.replace('/', "-"));
+            stmt.query_map(params![normalized], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+    // Calculate similarity scores
+    let mut results: Vec<SemanticSearchResult> = rows
+        .into_iter()
+        .filter_map(
+            |(msg_id, session_id, project, role, content, timestamp, emb_json)| {
+                let embedding: Vec<f32> = serde_json::from_str(&emb_json).ok()?;
+                let score = cosine_similarity(query_embedding, &embedding);
+
+                // Filter by role if specified
+                if let Some(ref role_filter) = role_filter {
+                    if role.as_str() != *role_filter {
+                        return None;
+                    }
+                }
+
+                Some(SemanticSearchResult {
+                    message_id: msg_id,
+                    session_id,
+                    project,
+                    role,
+                    content,
+                    timestamp,
+                    score,
+                })
+            },
+        )
+        .collect();
+
+    // Sort by score (highest first)
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    // Apply limit
+    results.truncate(limit);
+
+    Ok(results)
+}
+
+/// Check if embeddings have been generated
+#[allow(dead_code)]
+pub fn has_embeddings(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Get count of embeddings
+#[allow(dead_code)]
+pub fn embedding_count(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
