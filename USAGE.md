@@ -134,6 +134,24 @@ Claude: What did we discuss about Docker previously?
 (Claude calls search_vault internally)
 ```
 
+#### `search_wiki(query, limit?, min_quality?)`
+
+Search wiki pages for condensed knowledge. Uses FTS5 on processed wiki content.
+
+```
+Claude: What does the wiki say about Rust async patterns?
+(Claude calls search_wiki with min_quality=3 for high-quality content)
+```
+
+#### `get_synthesis(topic)`
+
+Get synthesis page for a topic. Synthesis pages combine related wiki pages.
+
+```
+Claude: Show me the synthesis for "docker".
+(Claude retrieves comprehensive summary from multiple sources)
+```
+
 #### `get_session(session_id)`
 
 Get full conversation by ID.
@@ -158,11 +176,36 @@ Find messages semantically similar to query (requires embeddings).
 Claude: Find similar discussions about error handling.
 ```
 
+#### `list_categories()`
+
+Browse all available categories in the wiki.
+
+```
+Claude: What categories are available in my wiki?
+```
+
+#### `find_entities(pattern, limit?)`
+
+Find entities (technologies, concepts, tools) by name pattern.
+
+```
+Claude: Find entities related to "rust".
+```
+
+#### `get_wiki_stats()`
+
+Get wiki statistics.
+
+```
+Claude: What are my wiki statistics?
+(Claude returns page count, synthesis count, categories, entities, avg quality)
+```
+
 ### Manual Testing
 
 ```bash
 echo '{"jsonrpc":"2.0","method":"tools/list","id":1}' | claude-vault-mcp
-echo '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_vault","arguments":{"query":"docker"}},"id":2}' | claude-vault-mcp
+echo '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"search_wiki","arguments":{"query":"rust"}},"id":2}' | claude-vault-mcp
 ```
 
 ## Binary 3: claude-trainer

@@ -14,8 +14,9 @@ use std::sync::Mutex;
 
 // Reuse db module functions from library
 use claude_vault::db::{
-    format_project_name, get_session_messages, has_embeddings, open_db, resolve_session_id, search,
-    stats,
+    find_entities, format_project_name, get_session_messages, get_synthesis_page, has_embeddings,
+    list_categories, open_db, resolve_session_id, search, search_wiki, stats, wiki_stats,
+    CategoryInfo, EntityInfo, SynthesisPage, WikiSearchResult, WikiStats,
 };
 
 #[cfg(test)]
@@ -77,6 +78,30 @@ struct GetSessionArgs {
 enum StatsArgs {
     WithSession { session_id: String },
     Global,
+}
+
+/// Tool arguments for search_wiki
+#[derive(Debug, Serialize, Deserialize)]
+struct SearchWikiArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    min_quality: Option<u8>,
+}
+
+/// Tool arguments for get_synthesis
+#[derive(Debug, Serialize, Deserialize)]
+struct GetSynthesisArgs {
+    topic: String,
+}
+
+/// Tool arguments for find_entities
+#[derive(Debug, Serialize, Deserialize)]
+struct FindEntitiesArgs {
+    pattern: String,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 /// MCP JSON-RPC 2.0 Response
@@ -239,6 +264,79 @@ fn list_tools() -> serde_json::Value {
                         }
                     },
                     "required": ["query"]
+                }
+            },
+            {
+                "name": "search_wiki",
+                "description": "Search wiki pages for condensed knowledge. Uses FTS5 full-text search on processed wiki content, which is higher quality and more structured than raw conversations.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query using FTS5 syntax (e.g., 'rust async', 'docker')"
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Maximum number of results to return (default: 20)",
+                            "default": 20
+                        },
+                        "min_quality": {
+                            "type": "number",
+                            "description": "Minimum quality score (1-5), filters for high-quality content (default: 3)",
+                            "default": 3
+                        }
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "name": "get_synthesis",
+                "description": "Get synthesis page for a topic. Synthesis pages combine related wiki pages into comprehensive summaries.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Topic name to get synthesis for (e.g., 'rust', 'docker')"
+                        }
+                    },
+                    "required": ["topic"]
+                }
+            },
+            {
+                "name": "list_categories",
+                "description": "List all available categories in the wiki. Categories organize knowledge by topic area.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "find_entities",
+                "description": "Find entities (technologies, concepts, tools) by name pattern. Useful for discovering what topics are covered in the wiki.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Pattern to search for in entity names (e.g., 'rust', 'docker')"
+                        },
+                        "limit": {
+                            "type": "number",
+                            "description": "Maximum number of results to return (default: 20)",
+                            "default": 20
+                        }
+                    },
+                    "required": ["pattern"]
+                }
+            },
+            {
+                "name": "get_wiki_stats",
+                "description": "Get statistics about the wiki including page count, synthesis count, category count, entity count, and average quality score.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             }
         ]
@@ -433,6 +531,171 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
                     }]
                 }))
             }
+        }
+        "search_wiki" => {
+            let args: SearchWikiArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for search_wiki: {}", e))?;
+
+            let limit = args.limit.unwrap_or(20).min(100);
+            let conn = get_connection()?;
+
+            let results = search_wiki(&conn, &args.query, limit, args.min_quality)?;
+
+            if results.is_empty() {
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text: format!("No wiki pages found for query: {}", args.query),
+                    }]
+                }))
+            } else {
+                let text: String = results
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "# {} (Quality: {})\nCategories: {}\nTags: {}\n\n{}\n---\nSession ID: {}",
+                            r.title,
+                            r.quality_score,
+                            r.categories.join(", "),
+                            r.tags.join(", "),
+                            r.content.chars().take(500).collect::<String>(),
+                            r.session_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text,
+                    }]
+                }))
+            }
+        }
+        "get_synthesis" => {
+            let args: GetSynthesisArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for get_synthesis: {}", e))?;
+
+            let conn = get_connection()?;
+
+            match get_synthesis_page(&conn, &args.topic)? {
+                Some(page) => {
+                    let text = format!(
+                        "# {}\n\nTopic: {}\n\n## Summary\n{}\n\n## Key Points\n{}\n\n## Related Entities\n{}\n\n## Related Topics\n{}\n\n## Sources\n{}",
+                        page.title,
+                        page.topic,
+                        page.summary,
+                        page.key_points.join("\n"),
+                        page.entities.join(", "),
+                        page.related_topics.join(", "),
+                        page.sources.join(", ")
+                    );
+
+                    Ok(serde_json::json!({
+                        "content": [ContentItem {
+                            content_type: "text",
+                            text,
+                        }]
+                    }))
+                }
+                None => Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text: format!("No synthesis page found for topic: {}", args.topic),
+                    }]
+                })),
+            }
+        }
+        "list_categories" => {
+            let conn = get_connection()?;
+
+            let categories = list_categories(&conn)?;
+
+            if categories.is_empty() {
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text: "No categories found. Wiki may not be generated yet.".to_string(),
+                    }]
+                }))
+            } else {
+                let text: String = categories
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{} - {} documents\n  {}",
+                            c.name,
+                            c.document_count,
+                            c.description.as_deref().unwrap_or("No description")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text,
+                    }]
+                }))
+            }
+        }
+        "find_entities" => {
+            let args: FindEntitiesArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for find_entities: {}", e))?;
+
+            let limit = args.limit.unwrap_or(20).min(100);
+            let conn = get_connection()?;
+
+            let entities = find_entities(&conn, &args.pattern, limit)?;
+
+            if entities.is_empty() {
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text: format!("No entities found matching pattern: {}", args.pattern),
+                    }]
+                }))
+            } else {
+                let text: String = entities
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{} ({}) - {} mentions",
+                            e.name, e.entity_type, e.mention_count
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text,
+                    }]
+                }))
+            }
+        }
+        "get_wiki_stats" => {
+            let conn = get_connection()?;
+            let stats = wiki_stats(&conn)?;
+
+            let text = format!(
+                "Wiki Statistics:\nPages: {}\nSynthesis pages: {}\nCategories: {}\nEntities: {}\nAverage quality: {:.1}/5",
+                stats.page_count,
+                stats.synthesis_count,
+                stats.category_count,
+                stats.entity_count,
+                stats.avg_quality
+            );
+
+            Ok(serde_json::json!({
+                "content": [ContentItem {
+                    content_type: "text",
+                    text,
+                }]
+            }))
         }
         _ => bail!("Unknown tool: {}", name),
     }
@@ -654,7 +917,7 @@ mod tests {
         assert!(tools_obj.contains_key("tools"));
 
         let tools_array = tools_obj["tools"].as_array().unwrap();
-        assert_eq!(tools_array.len(), 4);
+        assert_eq!(tools_array.len(), 9);
 
         // Check tool names
         let tool_names: Vec<&str> = tools_array
@@ -666,6 +929,11 @@ mod tests {
         assert!(tool_names.contains(&"get_session"));
         assert!(tool_names.contains(&"get_context_stats"));
         assert!(tool_names.contains(&"find_similar"));
+        assert!(tool_names.contains(&"search_wiki"));
+        assert!(tool_names.contains(&"get_synthesis"));
+        assert!(tool_names.contains(&"list_categories"));
+        assert!(tool_names.contains(&"find_entities"));
+        assert!(tool_names.contains(&"get_wiki_stats"));
     }
 
     #[test]

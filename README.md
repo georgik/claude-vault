@@ -448,19 +448,26 @@ Once connected, Claude Code can use these tools:
 
 | Tool | Description |
 |------|-------------|
-| `search_vault` | Full-text search through conversations using FTS5 syntax |
+| `search_vault` | Full-text search through raw conversations using FTS5 syntax |
+| `search_wiki` | Search wiki pages for condensed, high-quality knowledge |
+| `get_synthesis` | Get synthesis page combining related wiki pages on a topic |
 | `get_session` | Retrieve all messages from a specific session by ID |
 | `get_context_stats` | Get token/message statistics for sessions or entire vault |
 | `find_similar` | Find messages semantically similar to a query (requires embeddings) |
+| `list_categories` | Browse all available categories in the wiki |
+| `find_entities` | Find entities (technologies, concepts, tools) by name pattern |
+| `get_wiki_stats` | Get wiki statistics including page count and quality metrics |
 
 ### Usage in Claude Code
 
-After connecting the MCP server, ask Claude to search your history:
+After connecting the MCP server, ask Claude to search your knowledge base:
 
 ```
-Search my vault for "rust async error handling"
+Search my wiki for "rust async error handling"
 What did we discuss about docker deployment?
-Show me statistics for my conversation history
+Show me the synthesis for "docker containers"
+List all available categories
+What are my wiki statistics?
 ```
 
 ### Verify Connection

@@ -73,6 +73,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // Create embeddings table for semantic search
     init_embeddings(conn)?;
 
+    // Create wiki pages table with FTS5
+    init_wiki_tables(conn)?;
+
     // Create category tables for wiki generation
     conn.execute_batch(
         "
@@ -657,6 +660,49 @@ fn init_embeddings(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Initialize wiki tables with FTS5 support
+fn init_wiki_tables(conn: &Connection) -> Result<()> {
+    // Create base wiki_pages table (matches wiki.rs schema)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS wiki_pages (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            frontmatter TEXT NOT NULL,
+            content TEXT NOT NULL,
+            quality_score INTEGER,
+            created_at TEXT,
+            categories TEXT,
+            tags TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wiki_quality ON wiki_pages(quality_score);
+        CREATE INDEX IF NOT EXISTS idx_wiki_categories ON wiki_pages(categories);
+        ",
+    )?;
+
+    // Create synthesis_pages table
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS synthesis_pages (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            key_points TEXT,
+            entities TEXT,
+            related_topics TEXT,
+            sources TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_synthesis_topic ON synthesis_pages(topic);
+        ",
+    )?;
+
+    Ok(())
+}
+
 /// Store embedding for a message
 #[allow(dead_code)]
 pub fn store_embedding(conn: &Connection, message_id: i64, embedding: &[f32]) -> Result<()> {
@@ -824,6 +870,246 @@ pub fn has_embeddings(conn: &Connection) -> Result<bool> {
 pub fn embedding_count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
         .map_err(Into::into)
+}
+
+// ============================================================================
+// Wiki search functions
+// ============================================================================
+
+/// Result from wiki search
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct WikiSearchResult {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub quality_score: i32,
+    pub categories: Vec<String>,
+    pub tags: Vec<String>,
+    pub session_id: String,
+}
+
+/// Search wiki pages using full-text search
+#[allow(dead_code)]
+pub fn search_wiki(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    min_quality: Option<u8>,
+) -> Result<Vec<WikiSearchResult>> {
+    let limit = limit.min(100);
+
+    // Build WHERE clause
+    let mut where_clauses = vec!["1=1".to_string()];
+    if let Some(min_q) = min_quality {
+        where_clauses.push(format!("quality_score >= {}", min_q));
+    }
+
+    // Add content search using LIKE (simplified, can add FTS5 later)
+    where_clauses.push(format!("(content LIKE '%{query}%' OR title LIKE '%{query}%' OR categories LIKE '%{query}%' OR tags LIKE '%{query}%')",
+        query = query.replace('\'', "''")));
+
+    let sql = format!(
+        "SELECT id, title, content, quality_score, categories, tags
+         FROM wiki_pages
+         WHERE {}
+         ORDER BY quality_score DESC
+         LIMIT {limit}",
+        where_clauses.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows: Vec<(String, String, String, i32, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let results: Vec<WikiSearchResult> = rows
+        .into_iter()
+        .map(
+            |(id, title, content, quality_score, categories_json, tags_json)| {
+                let categories: Vec<String> =
+                    serde_json::from_str(&categories_json).unwrap_or_default();
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+
+                WikiSearchResult {
+                    id: id.clone(),
+                    title,
+                    content,
+                    quality_score,
+                    categories,
+                    tags,
+                    session_id: id,
+                }
+            },
+        )
+        .collect();
+
+    Ok(results)
+}
+
+/// Get synthesis page by topic
+#[allow(dead_code)]
+pub fn get_synthesis_page(conn: &Connection, topic: &str) -> Result<Option<SynthesisPage>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, topic, summary, key_points, entities, related_topics, sources
+         FROM synthesis_pages
+         WHERE topic = ?1",
+    )?;
+
+    let result = stmt
+        .query_row(params![topic], |row| {
+            let key_points: String = row.get(4)?;
+            let entities: String = row.get(5)?;
+            let related: String = row.get(6)?;
+            let sources: String = row.get(7)?;
+
+            Ok(SynthesisPage {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                topic: row.get(2)?,
+                summary: row.get(3)?,
+                key_points: serde_json::from_str(&key_points).unwrap_or_default(),
+                entities: serde_json::from_str(&entities).unwrap_or_default(),
+                related_topics: serde_json::from_str(&related).unwrap_or_default(),
+                sources: serde_json::from_str(&sources).unwrap_or_default(),
+            })
+        })
+        .ok();
+
+    Ok(result)
+}
+
+/// Synthesis page structure
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SynthesisPage {
+    pub id: String,
+    pub title: String,
+    pub topic: String,
+    pub summary: String,
+    pub key_points: Vec<String>,
+    pub entities: Vec<String>,
+    pub related_topics: Vec<String>,
+    pub sources: Vec<String>,
+}
+
+/// List all available categories
+#[allow(dead_code)]
+pub fn list_categories(conn: &Connection) -> Result<Vec<CategoryInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, document_count
+         FROM categories
+         ORDER BY document_count DESC",
+    )?;
+
+    let categories = stmt
+        .query_map([], |row| {
+            Ok(CategoryInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                document_count: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(categories)
+}
+
+/// Category information
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct CategoryInfo {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub document_count: i64,
+}
+
+/// Find entities by name pattern
+#[allow(dead_code)]
+pub fn find_entities(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<EntityInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, entity_type, COUNT(*) as mention_count
+         FROM entities
+         WHERE name LIKE ?1
+         GROUP BY id
+         ORDER BY mention_count DESC
+         LIMIT ?2",
+    )?;
+
+    let entities = stmt
+        .query_map(params![format!("%{}%", pattern), limit as i64], |row| {
+            Ok(EntityInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                entity_type: row.get(2)?,
+                mention_count: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(entities)
+}
+
+/// Entity information
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct EntityInfo {
+    pub id: i64,
+    pub name: String,
+    pub entity_type: String,
+    pub mention_count: i64,
+}
+
+/// Get wiki statistics
+#[allow(dead_code)]
+pub fn wiki_stats(conn: &Connection) -> Result<WikiStats> {
+    let page_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM wiki_pages", [], |row| row.get(0))?;
+    let synthesis_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM synthesis_pages", [], |row| row.get(0))?;
+    let category_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM categories", [], |row| row.get(0))?;
+    let entity_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+
+    let avg_quality: f64 = conn
+        .query_row(
+            "SELECT AVG(quality_score) FROM wiki_pages WHERE quality_score > 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    Ok(WikiStats {
+        page_count,
+        synthesis_count,
+        category_count,
+        entity_count,
+        avg_quality,
+    })
+}
+
+/// Wiki statistics
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct WikiStats {
+    pub page_count: i64,
+    pub synthesis_count: i64,
+    pub category_count: i64,
+    pub entity_count: i64,
+    pub avg_quality: f64,
 }
 
 #[cfg(test)]
