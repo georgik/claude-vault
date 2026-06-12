@@ -449,14 +449,69 @@ Once connected, Claude Code can use these tools:
 | Tool | Description |
 |------|-------------|
 | `search_vault` | Full-text search through raw conversations using FTS5 syntax |
-| `search_wiki` | Search wiki pages for condensed, high-quality knowledge |
-| `get_synthesis` | Get synthesis page combining related wiki pages on a topic |
+| `search_wiki` | Search wiki pages for condensed, high-quality knowledge (supports themed wikis) |
+| `get_synthesis` | Get synthesis page combining related wiki pages on a topic (supports themed wikis) |
 | `get_session` | Retrieve all messages from a specific session by ID |
 | `get_context_stats` | Get token/message statistics for sessions or entire vault |
 | `find_similar` | Find messages semantically similar to a query (requires embeddings) |
-| `list_categories` | Browse all available categories in the wiki |
-| `find_entities` | Find entities (technologies, concepts, tools) by name pattern |
-| `get_wiki_stats` | Get wiki statistics including page count and quality metrics |
+| `list_categories` | Browse all available categories in the wiki (supports themed wikis) |
+| `find_entities` | Find entities (technologies, concepts, tools) by name pattern (supports themed wikis) |
+| `get_wiki_stats` | Get wiki statistics including page count and quality metrics (supports themed wikis) |
+| `list_themes` | List all available themes for domain-specific wikis |
+| `get_theme` | Get details of a specific theme |
+| `create_theme` | Create a new theme for domain-specific wiki projection |
+| `delete_theme` | Delete a theme and its wiki database |
+| `rebuild_theme` | Rebuild a themed wiki from vault (full projection) |
+| `increment_theme` | Incrementally update themed wiki with session (supports project-scoped resolution) |
+
+### Themed Wikis
+
+Themes let you create domain-specific wiki projections from your vault. Instead of searching all conversations, you can create focused wikis for specific topics like "rust", "embedded", or "ml".
+
+**Workflow:**
+
+1. Create a theme with keywords:
+```
+Create a theme for Rust development with keywords: rust, tokio, async, cargo
+```
+
+2. Rebuild the themed wiki at session start:
+```
+Rebuild the rust theme wiki
+```
+
+3. Search the themed wiki during the session:
+```
+Search the rust wiki for "tokio spawn"
+```
+
+4. Update the wiki incrementally during the session:
+```
+Increment the rust theme for project "my-app"
+```
+
+**Architecture:**
+
+- **vault.db**: Immutable super-state with all historical knowledge
+- **sessions.db**: Mutable state tracking current sessions per project (enables parallel workflows)
+- **themed wikis**: Mutable, domain-specific projections (e.g., rust.db, embedded.db)
+- **Session workflow**: Full projection at start, incremental updates during session
+
+**Project-Scoped Sessions:**
+
+For parallel sessions across different projects, `increment_theme` supports project-scoped resolution:
+
+- **Global latest**: `session_id: "latest"` resolves to most recent session across all projects
+- **Project-scoped**: `project: "my-app"` resolves to current session for that specific project
+
+This enables multiple simultaneous sessions in different projects without conflicts.
+
+**Benefits:**
+
+- Focused search: Only relevant knowledge for your current project
+- Faster queries: Smaller, targeted databases
+- Cross-pollination: Discoveries from one session available in future themed wikis
+- Parallel workflows: Multiple projects can maintain separate session contexts
 
 ### Usage in Claude Code
 

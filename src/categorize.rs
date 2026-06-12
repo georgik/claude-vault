@@ -248,6 +248,34 @@ impl Categorizer {
 
         format!("{} - {}", title_base, subcategory)
     }
+
+    /// Categorize a session from vault database (for themed wiki generation)
+    /// Returns category result without saving to database
+    pub fn categorize_session_vault(
+        &self,
+        vault_conn: &Connection,
+        session_id: &str,
+    ) -> Result<CategoryResult> {
+        let messages = get_session_messages(vault_conn, session_id)?;
+
+        if messages.is_empty() {
+            anyhow::bail!("Session {} has no messages", session_id);
+        }
+
+        // Combine all user messages for analysis
+        let combined_content: String = messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if combined_content.len() < 50 {
+            anyhow::bail!("Not enough content to categorize");
+        }
+
+        Ok(self.categorize_content(&combined_content))
+    }
 }
 
 /// Initialize categories table in database

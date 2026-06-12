@@ -14,10 +14,12 @@ use std::sync::Mutex;
 
 // Reuse db module functions from library
 use claude_vault::db::{
-    find_entities, format_project_name, get_session_messages, get_synthesis_page, has_embeddings,
-    list_categories, open_db, resolve_session_id, search, search_wiki, stats, wiki_stats,
-    CategoryInfo, EntityInfo, SynthesisPage, WikiSearchResult, WikiStats,
+    create_theme, delete_theme, find_entities, format_project_name, get_session_messages,
+    get_synthesis_page, has_embeddings, list_categories, load_themes, open_db, resolve_session_id,
+    search, search_wiki, stats, wiki_stats, CategoryInfo, EntityInfo, SynthesisPage, Theme,
+    WikiSearchResult, WikiStats,
 };
+use claude_vault::pipeline;
 
 #[cfg(test)]
 use claude_vault::db::{insert_message, upsert_session};
@@ -88,12 +90,16 @@ struct SearchWikiArgs {
     limit: Option<usize>,
     #[serde(default)]
     min_quality: Option<u8>,
+    #[serde(default)]
+    theme_id: Option<String>,
 }
 
 /// Tool arguments for get_synthesis
 #[derive(Debug, Serialize, Deserialize)]
 struct GetSynthesisArgs {
     topic: String,
+    #[serde(default)]
+    theme_id: Option<String>,
 }
 
 /// Tool arguments for find_entities
@@ -102,6 +108,8 @@ struct FindEntitiesArgs {
     pattern: String,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    theme_id: Option<String>,
 }
 
 /// MCP JSON-RPC 2.0 Response
@@ -173,6 +181,16 @@ fn get_db_path() -> Result<PathBuf> {
 fn get_connection() -> Result<Connection> {
     let db_path = get_db_path()?;
     open_db(&db_path)
+}
+
+/// Get database connection for specific theme or default
+fn get_wiki_connection(theme_id: Option<&str>) -> Result<Connection> {
+    if let Some(tid) = theme_id {
+        claude_vault::db::open_theme_wiki(tid)
+    } else {
+        let conn = get_connection()?;
+        Ok(conn)
+    }
 }
 
 /// Server capabilities for initialize response
@@ -285,6 +303,10 @@ fn list_tools() -> serde_json::Value {
                             "type": "number",
                             "description": "Minimum quality score (1-5), filters for high-quality content (default: 3)",
                             "default": 3
+                        },
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Optional theme ID to search in themed wiki instead of default"
                         }
                     },
                     "required": ["query"]
@@ -299,6 +321,10 @@ fn list_tools() -> serde_json::Value {
                         "topic": {
                             "type": "string",
                             "description": "Topic name to get synthesis for (e.g., 'rust', 'docker')"
+                        },
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Optional theme ID to get synthesis from themed wiki instead of default"
                         }
                     },
                     "required": ["topic"]
@@ -309,7 +335,12 @@ fn list_tools() -> serde_json::Value {
                 "description": "List all available categories in the wiki. Categories organize knowledge by topic area.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Optional theme ID to list categories from themed wiki instead of default"
+                        }
+                    }
                 }
             },
             {
@@ -326,6 +357,10 @@ fn list_tools() -> serde_json::Value {
                             "type": "number",
                             "description": "Maximum number of results to return (default: 20)",
                             "default": 20
+                        },
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Optional theme ID to find entities in themed wiki instead of default"
                         }
                     },
                     "required": ["pattern"]
@@ -336,7 +371,116 @@ fn list_tools() -> serde_json::Value {
                 "description": "Get statistics about the wiki including page count, synthesis count, category count, entity count, and average quality score.",
                 "inputSchema": {
                     "type": "object",
+                    "properties": {
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Optional theme ID to get stats from themed wiki instead of default"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "list_themes",
+                "description": "List all available themes. Themes are domain-specific wiki projections for focused knowledge.",
+                "inputSchema": {
+                    "type": "object",
                     "properties": {}
+                }
+            },
+            {
+                "name": "get_theme",
+                "description": "Get details of a specific theme by ID.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Theme ID to get details for"
+                        }
+                    },
+                    "required": ["theme_id"]
+                }
+            },
+            {
+                "name": "create_theme",
+                "description": "Create a new theme for domain-specific wiki projection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Theme ID (slug format: letters, numbers, hyphens, underscores only)"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Human-readable theme name"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Description of what this theme covers"
+                        },
+                        "keywords": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Keywords for filtering vault content (e.g., ['rust', 'tokio', 'async'])"
+                        }
+                    },
+                    "required": ["id", "name", "description", "keywords"]
+                }
+            },
+            {
+                "name": "delete_theme",
+                "description": "Delete a theme and its wiki database.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Theme ID to delete"
+                        }
+                    },
+                    "required": ["theme_id"]
+                }
+            },
+            {
+                "name": "rebuild_theme",
+                "description": "Rebuild a themed wiki from vault. Runs full pipeline projection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Theme ID to rebuild"
+                        },
+                        "min_quality": {
+                            "type": "number",
+                            "description": "Minimum quality threshold (1-5, default: 3)",
+                            "default": 3
+                        }
+                    },
+                    "required": ["theme_id"]
+                }
+            },
+            {
+                "name": "increment_theme",
+                "description": "Incrementally update themed wiki. Accepts session_id (or 'latest' for global most recent), or project (resolves to current session for that project).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "theme_id": {
+                            "type": "string",
+                            "description": "Theme ID to update"
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID to add to theme, or 'latest' for global most recent session"
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Project name to resolve to current session"
+                        }
+                    },
+                    "required": ["theme_id"]
                 }
             }
         ]
@@ -537,7 +681,7 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
                 .map_err(|e| anyhow!("Invalid arguments for search_wiki: {}", e))?;
 
             let limit = args.limit.unwrap_or(20).min(100);
-            let conn = get_connection()?;
+            let conn = get_wiki_connection(args.theme_id.as_deref())?;
 
             let results = search_wiki(&conn, &args.query, limit, args.min_quality)?;
 
@@ -577,7 +721,7 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             let args: GetSynthesisArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| anyhow!("Invalid arguments for get_synthesis: {}", e))?;
 
-            let conn = get_connection()?;
+            let conn = get_wiki_connection(args.theme_id.as_deref())?;
 
             match get_synthesis_page(&conn, &args.topic)? {
                 Some(page) => {
@@ -608,7 +752,15 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             }
         }
         "list_categories" => {
-            let conn = get_connection()?;
+            #[derive(Deserialize)]
+            struct ListCategoriesArgs {
+                #[serde(default)]
+                theme_id: Option<String>,
+            }
+            let args: ListCategoriesArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for list_categories: {}", e))?;
+
+            let conn = get_wiki_connection(args.theme_id.as_deref())?;
 
             let categories = list_categories(&conn)?;
 
@@ -646,7 +798,7 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
                 .map_err(|e| anyhow!("Invalid arguments for find_entities: {}", e))?;
 
             let limit = args.limit.unwrap_or(20).min(100);
-            let conn = get_connection()?;
+            let conn = get_wiki_connection(args.theme_id.as_deref())?;
 
             let entities = find_entities(&conn, &args.pattern, limit)?;
 
@@ -678,7 +830,15 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             }
         }
         "get_wiki_stats" => {
-            let conn = get_connection()?;
+            #[derive(Deserialize)]
+            struct GetWikiStatsArgs {
+                #[serde(default)]
+                theme_id: Option<String>,
+            }
+            let args: GetWikiStatsArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for get_wiki_stats: {}", e))?;
+
+            let conn = get_wiki_connection(args.theme_id.as_deref())?;
             let stats = wiki_stats(&conn)?;
 
             let text = format!(
@@ -697,6 +857,195 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
                 }]
             }))
         }
+        "list_themes" => {
+            let themes = load_themes()?;
+
+            if themes.is_empty() {
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text: "No themes found. Create a theme with create_theme.".to_string(),
+                    }]
+                }))
+            } else {
+                let text: String = themes
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{} - {}\n  Description: {}\n  Keywords: {}\n  Entries: {}\n  Created: {}",
+                            t.id,
+                            t.name,
+                            t.description,
+                            t.keywords.join(", "),
+                            t.entry_count,
+                            t.created_at
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+
+                Ok(serde_json::json!({
+                    "content": [ContentItem {
+                        content_type: "text",
+                        text,
+                    }]
+                }))
+            }
+        }
+        "get_theme" => {
+            #[derive(Deserialize)]
+            struct GetThemeArgs {
+                theme_id: String,
+            }
+            let args: GetThemeArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for get_theme: {}", e))?;
+
+            let theme = claude_vault::db::get_theme(&args.theme_id)?;
+
+            let text = format!(
+                "{} - {}\n  Description: {}\n  Keywords: {}\n  Entries: {}\n  Created: {}\n  Wiki DB: {}",
+                theme.id,
+                theme.name,
+                theme.description,
+                theme.keywords.join(", "),
+                theme.entry_count,
+                theme.created_at,
+                theme.wiki_db
+            );
+
+            Ok(serde_json::json!({
+                "content": [ContentItem {
+                    content_type: "text",
+                    text,
+                }]
+            }))
+        }
+        "create_theme" => {
+            #[derive(Deserialize)]
+            struct CreateThemeArgs {
+                id: String,
+                name: String,
+                description: String,
+                keywords: Vec<String>,
+            }
+            let args: CreateThemeArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for create_theme: {}", e))?;
+
+            let theme = create_theme(args.id, args.name, args.description, args.keywords)?;
+
+            let text = format!(
+                "Theme created:\n{} - {}\n  Description: {}\n  Keywords: {}\n  Wiki DB: {}",
+                theme.id,
+                theme.name,
+                theme.description,
+                theme.keywords.join(", "),
+                theme.wiki_db
+            );
+
+            Ok(serde_json::json!({
+                "content": [ContentItem {
+                    content_type: "text",
+                    text,
+                }]
+            }))
+        }
+        "delete_theme" => {
+            #[derive(Deserialize)]
+            struct DeleteThemeArgs {
+                theme_id: String,
+            }
+            let args: DeleteThemeArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for delete_theme: {}", e))?;
+
+            delete_theme(&args.theme_id)?;
+
+            Ok(serde_json::json!({
+                "content": [ContentItem {
+                    content_type: "text",
+                    text: format!("Theme deleted: {}", args.theme_id),
+                }]
+            }))
+        }
+        "rebuild_theme" => {
+            #[derive(Deserialize)]
+            struct RebuildThemeArgs {
+                theme_id: String,
+                #[serde(default = "default_min_quality")]
+                min_quality: u8,
+            }
+            let args: RebuildThemeArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for rebuild_theme: {}", e))?;
+
+            let vault_conn = get_connection()?;
+            let theme = claude_vault::db::get_theme(&args.theme_id)?;
+
+            let config = claude_vault::pipeline::PipelineConfig {
+                min_quality: args.min_quality,
+                deduplicate: true,
+                fix_formatting: true,
+                generate_synthesis: true,
+                synthesis_limit: 10,
+            };
+
+            let stats = claude_vault::pipeline::run_themed_pipeline(
+                &vault_conn,
+                &args.theme_id,
+                &theme.keywords,
+                &config,
+            )?;
+
+            let text = format!(
+                "Theme rebuilt: {}\nSessions processed: {}\nWiki pages generated: {}\nEntities extracted: {}\nSynthesis pages: {}",
+                args.theme_id,
+                stats.sessions_processed,
+                stats.wiki_pages_generated,
+                stats.entities_extracted,
+                stats.synthesis_pages
+            );
+
+            Ok(serde_json::json!({
+                "content": [ContentItem {
+                    content_type: "text",
+                    text,
+                }]
+            }))
+        }
+        "increment_theme" => {
+            #[derive(Deserialize)]
+            struct IncrementThemeArgs {
+                theme_id: String,
+                #[serde(default)]
+                session_id: Option<String>,
+                #[serde(default)]
+                project: Option<String>,
+            }
+            let args: IncrementThemeArgs = serde_json::from_value(arguments.clone())
+                .map_err(|e| anyhow!("Invalid arguments for increment_theme: {}", e))?;
+
+            let vault_conn = get_connection()?;
+
+            let stats = claude_vault::pipeline::increment_themed_wiki(
+                &vault_conn,
+                &args.theme_id,
+                args.session_id.as_deref(),
+                args.project.as_deref(),
+            )?;
+
+            let text = format!(
+                "Theme updated: {}\nSessions processed: {}\nWiki pages generated: {}\nEntities extracted: {}",
+                args.theme_id,
+                stats.sessions_processed,
+                stats.wiki_pages_generated,
+                stats.entities_extracted
+            );
+
+            Ok(serde_json::json!({
+                "content": [ContentItem {
+                    content_type: "text",
+                    text,
+                }]
+            }))
+        }
         _ => bail!("Unknown tool: {}", name),
     }
 }
@@ -704,6 +1053,11 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
 /// Rough token estimation (approximately 4 chars per token)
 fn estimate_tokens(text: &str) -> usize {
     (text.len() + 3) / 4
+}
+
+/// Default minimum quality for rebuild_theme
+fn default_min_quality() -> u8 {
+    3
 }
 
 /// Send MCP response
@@ -917,7 +1271,7 @@ mod tests {
         assert!(tools_obj.contains_key("tools"));
 
         let tools_array = tools_obj["tools"].as_array().unwrap();
-        assert_eq!(tools_array.len(), 9);
+        assert!(tools_array.len() >= 14);
 
         // Check tool names
         let tool_names: Vec<&str> = tools_array
@@ -934,6 +1288,12 @@ mod tests {
         assert!(tool_names.contains(&"list_categories"));
         assert!(tool_names.contains(&"find_entities"));
         assert!(tool_names.contains(&"get_wiki_stats"));
+        assert!(tool_names.contains(&"list_themes"));
+        assert!(tool_names.contains(&"get_theme"));
+        assert!(tool_names.contains(&"create_theme"));
+        assert!(tool_names.contains(&"delete_theme"));
+        assert!(tool_names.contains(&"rebuild_theme"));
+        assert!(tool_names.contains(&"increment_theme"));
     }
 
     #[test]
@@ -994,5 +1354,35 @@ mod tests {
         let parsed: SearchArgs = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.query, "test");
         assert!(parsed.limit.is_none());
+    }
+
+    #[test]
+    fn test_search_wiki_args_with_theme() {
+        let json = json!({"query": "rust", "theme_id": "rust-theme"});
+        let parsed: SearchWikiArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.query, "rust");
+        assert_eq!(parsed.theme_id, Some("rust-theme".to_string()));
+    }
+
+    #[test]
+    fn test_search_wiki_args_defaults() {
+        let json = json!({"query": "docker"});
+        let parsed: SearchWikiArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.query, "docker");
+        assert!(parsed.theme_id.is_none());
+        assert!(parsed.limit.is_none());
+    }
+
+    #[test]
+    fn test_find_entities_args_with_theme() {
+        let json = json!({"pattern": "tokio", "theme_id": "rust-theme"});
+        let parsed: FindEntitiesArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.pattern, "tokio");
+        assert_eq!(parsed.theme_id, Some("rust-theme".to_string()));
+    }
+
+    #[test]
+    fn test_default_min_quality() {
+        assert_eq!(default_min_quality(), 3);
     }
 }

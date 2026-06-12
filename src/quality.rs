@@ -316,6 +316,48 @@ impl QualityScorer {
 
         reasons.join(". ")
     }
+
+    /// Score a session from vault database (for themed wiki generation)
+    /// Returns quality result without saving to database
+    pub fn score_session_vault(
+        &self,
+        vault_conn: &Connection,
+        session_id: &str,
+    ) -> Result<QualityResult> {
+        let messages = get_session_messages(vault_conn, session_id)?;
+
+        if messages.is_empty() {
+            return Ok(QualityResult {
+                score: QualityScore(1),
+                reasoning: "No messages in session".to_string(),
+                metrics: QualityMetrics {
+                    code_blocks: 0,
+                    resolution_count: 0,
+                    technical_depth: 1,
+                    actionability: 1,
+                    explanation_quality: 1,
+                },
+            });
+        }
+
+        // Extract all assistant messages for analysis
+        let assistant_messages: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| m.content.as_str())
+            .collect();
+
+        let combined_content = assistant_messages.join("\n");
+        let metrics = self.compute_metrics(&combined_content);
+        let score = self.compute_score(&metrics, &combined_content);
+        let reasoning = self.generate_reasoning(&score, &metrics, &combined_content);
+
+        Ok(QualityResult {
+            score,
+            reasoning,
+            metrics,
+        })
+    }
 }
 
 /// Initialize quality scoring tables

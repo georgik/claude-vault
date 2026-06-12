@@ -163,6 +163,66 @@ impl WikiGenerator {
 
         format!("---\n{}---\n\n{}", frontmatter_yaml, page.content)
     }
+
+    /// Generate wiki page from messages directly (for themed wiki generation)
+    pub fn generate_page_from_messages(
+        &self,
+        messages: &[crate::db::Message],
+        session_id: &str,
+        quality_result: &QualityResult,
+        categories: &[String],
+        tags: &[String],
+    ) -> Result<WikiPage> {
+        if messages.is_empty() {
+            anyhow::bail!("No messages provided");
+        }
+
+        // Convert messages to SearchResult format for reuse
+        let search_results: Vec<crate::db::SearchResult> = messages
+            .iter()
+            .map(|m| crate::db::SearchResult {
+                session_id: session_id.to_string(),
+                project: "themed".to_string(),
+                role: m.role.clone(),
+                content: m.content.clone(),
+                timestamp: m.timestamp.clone(),
+            })
+            .collect();
+
+        // Extract title from first user message
+        let title = self.extract_title(&search_results);
+
+        // Clean content for wiki
+        let content = self.clean_content(&search_results);
+
+        // Detect cross-references
+        let references = self.detect_references(&content);
+
+        // Generate frontmatter
+        let frontmatter = Frontmatter {
+            title: title.clone(),
+            categories: categories.to_vec(),
+            tags: tags.to_vec(),
+            quality_score: quality_result.score.value(),
+            created_at: messages
+                .iter()
+                .find_map(|m| m.timestamp.as_ref())
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            session_id: session_id.to_string(),
+            content_type: "conversation".to_string(),
+            related: None,
+            entities: None,
+        };
+
+        Ok(WikiPage {
+            id: session_id.to_string(),
+            title,
+            frontmatter,
+            content,
+            references,
+        })
+    }
 }
 
 /// Initialize wiki pages table

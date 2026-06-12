@@ -1,6 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Convert project directory names like "-home-murou-ghq-github-com-user-repo" to "user/repo"
 pub fn format_project_name(raw: &str) -> String {
@@ -1112,6 +1113,346 @@ pub struct WikiStats {
     pub avg_quality: f64,
 }
 
+// ============================================================================
+// Theme support for themed wikis
+// ============================================================================
+
+/// Theme for domain-specific wiki projection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Theme {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub keywords: Vec<String>,
+    pub wiki_db: String,
+    pub created_at: String,
+    pub entry_count: i64,
+}
+
+/// Theme registry loaded from themes.json
+#[derive(Debug, Serialize, Deserialize)]
+struct ThemeRegistry {
+    themes: Vec<Theme>,
+    #[serde(default)]
+    default_theme: Option<String>,
+}
+
+/// Get the wiki directory path
+pub fn wiki_dir() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Failed to find data directory"))?;
+    Ok(data_dir.join("claude-vault").join("wiki"))
+}
+
+/// Get the themes.json path
+pub fn themes_json_path() -> Result<PathBuf> {
+    Ok(wiki_dir()?.join("themes.json"))
+}
+
+/// Ensure wiki directory exists
+pub fn ensure_wiki_dir() -> Result<()> {
+    let dir = wiki_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create wiki directory: {}", dir.display()))?;
+    Ok(())
+}
+
+/// Load all themes from themes.json
+#[allow(dead_code)]
+pub fn load_themes() -> Result<Vec<Theme>> {
+    let path = themes_json_path()?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read themes.json: {}", path.display()))?;
+
+    let registry: ThemeRegistry = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse themes.json: {}", path.display()))?;
+
+    Ok(registry.themes)
+}
+
+/// Save themes to themes.json
+fn save_themes(themes: &[Theme]) -> Result<()> {
+    ensure_wiki_dir()?;
+
+    let path = themes_json_path()?;
+    let registry = ThemeRegistry {
+        themes: themes.to_vec(),
+        default_theme: None,
+    };
+
+    let content =
+        serde_json::to_string_pretty(&registry).with_context(|| "Failed to serialize themes")?;
+
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write themes.json: {}", path.display()))?;
+
+    Ok(())
+}
+
+/// Get theme by ID
+#[allow(dead_code)]
+pub fn get_theme(id: &str) -> Result<Theme> {
+    let themes = load_themes()?;
+    themes
+        .into_iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| anyhow!("Theme not found: {}", id))
+}
+
+/// Create a new theme
+#[allow(dead_code)]
+pub fn create_theme(
+    id: String,
+    name: String,
+    description: String,
+    keywords: Vec<String>,
+) -> Result<Theme> {
+    // Validate ID is slug-like
+    if !id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("Invalid theme ID: must contain only letters, numbers, hyphens, underscores");
+    }
+
+    // Check for duplicate
+    let themes = load_themes()?;
+    if themes.iter().any(|t| t.id == id) {
+        bail!("Theme already exists: {}", id);
+    }
+
+    ensure_wiki_dir()?;
+
+    let wiki_db = format!("{}/{}.db", wiki_dir()?.display(), id);
+
+    let theme = Theme {
+        id: id.clone(),
+        name,
+        description,
+        keywords,
+        wiki_db,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        entry_count: 0,
+    };
+
+    let mut updated_themes = themes;
+    updated_themes.push(theme.clone());
+    save_themes(&updated_themes)?;
+
+    Ok(theme)
+}
+
+/// Delete a theme
+#[allow(dead_code)]
+pub fn delete_theme(id: &str) -> Result<()> {
+    let themes = load_themes()?;
+    let theme = themes
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| anyhow!("Theme not found: {}", id))?;
+
+    // Delete wiki database
+    let db_path = PathBuf::from(&theme.wiki_db);
+    if db_path.exists() {
+        std::fs::remove_file(&db_path)
+            .with_context(|| format!("Failed to delete wiki database: {}", db_path.display()))?;
+    }
+
+    // Remove from registry
+    let updated_themes: Vec<_> = themes.into_iter().filter(|t| t.id != id).collect();
+    save_themes(&updated_themes)?;
+
+    Ok(())
+}
+
+/// Get wiki database path for a theme
+#[allow(dead_code)]
+pub fn theme_wiki_path(theme_id: &str) -> Result<PathBuf> {
+    let theme = get_theme(theme_id)?;
+    Ok(PathBuf::from(theme.wiki_db))
+}
+
+/// Open wiki database for a theme
+#[allow(dead_code)]
+pub fn open_theme_wiki(theme_id: &str) -> Result<Connection> {
+    let db_path = theme_wiki_path(theme_id)?;
+    if !db_path.exists() {
+        bail!(
+            "Theme wiki database not found: {}. Run rebuild_theme first.",
+            db_path.display()
+        );
+    }
+    open_db(&db_path)
+}
+
+/// Get default wiki database path (wiki.db)
+pub fn default_wiki_path() -> Result<PathBuf> {
+    Ok(wiki_dir()?.join("wiki.db"))
+}
+
+/// Open default wiki database
+#[allow(dead_code)]
+pub fn open_default_wiki() -> Result<Connection> {
+    let db_path = default_wiki_path()?;
+    open_db(&db_path)
+}
+
+/// Filter sessions by keywords using FTS5
+/// Returns session IDs that match any of the keywords
+#[allow(dead_code)]
+pub fn filter_sessions_by_keywords(conn: &Connection, keywords: &[String]) -> Result<Vec<String>> {
+    if keywords.is_empty() {
+        // Return all sessions if no keywords
+        let mut stmt = conn.prepare("SELECT DISTINCT session_id FROM sessions")?;
+        let result = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(result);
+    }
+
+    // Build FTS5 query with OR between keywords
+    let query = keywords
+        .iter()
+        .map(|k| format!("\"{}\"", k.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let sql = "
+        SELECT DISTINCT m.session_id
+        FROM messages_fts f
+        JOIN messages m ON m.id = f.rowid
+        WHERE messages_fts MATCH ?1
+    ";
+
+    let mut stmt = conn.prepare(sql)?;
+    let session_ids: Vec<String> = stmt
+        .query_map(params![query], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(session_ids)
+}
+
+/// Get messages for a specific session
+#[allow(dead_code)]
+pub fn get_session_messages_for_wiki(conn: &Connection, session_id: &str) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, role, content, timestamp
+         FROM messages
+         WHERE session_id = ?1
+         ORDER BY id",
+    )?;
+
+    let messages = stmt
+        .query_map(params![session_id], |row| {
+            Ok(Message {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                timestamp: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(messages)
+}
+
+/// Message structure for wiki generation
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Message {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+}
+
+// ============================================================================
+// Current session tracking for parallel project sessions
+// ============================================================================
+
+/// Get the sessions.db path
+pub fn sessions_db_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Failed to find data directory"))?;
+    Ok(data_dir.join("claude-vault").join("sessions.db"))
+}
+
+/// Open or create sessions.db
+pub fn open_sessions_db() -> Result<Connection> {
+    let path = sessions_db_path()?;
+    let conn = Connection::open(&path)
+        .with_context(|| format!("Failed to open sessions database: {}", path.display()))?;
+
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;
+         CREATE TABLE IF NOT EXISTS current_sessions (
+             project TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+
+    Ok(conn)
+}
+
+/// Set current session for a project
+pub fn set_current_session(conn: &Connection, project: &str, session_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO current_sessions (project, session_id) VALUES (?1, ?2)
+         ON CONFLICT(project) DO UPDATE SET session_id=excluded.session_id, updated_at=datetime('now')",
+        params![project, session_id],
+    )?;
+    Ok(())
+}
+
+/// Get current session for a project
+pub fn get_current_session(conn: &Connection, project: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT session_id FROM current_sessions WHERE project = ?1",
+            params![project],
+            |row| row.get(0),
+        )
+        .ok())
+}
+
+/// Delete current session for a project
+pub fn delete_current_session(conn: &Connection, project: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM current_sessions WHERE project = ?1",
+        params![project],
+    )?;
+    Ok(())
+}
+
+/// List all current sessions
+pub fn list_current_sessions(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT project, session_id FROM current_sessions ORDER BY updated_at DESC")?;
+
+    let sessions = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(sessions)
+}
+
+/// Get latest session ID
+/// If project is None, returns global most recent from vault
+/// If project is Some, resolves to that project's current session via sessions.db
+pub fn get_latest_session(vault_conn: &Connection, project: Option<&str>) -> Result<String> {
+    if let Some(proj) = project {
+        let sessions_conn = open_sessions_db()?;
+        get_current_session(&sessions_conn, proj)?
+            .ok_or_else(|| anyhow!("No current session for project: {}", proj))
+    } else {
+        nth_recent_session_id(vault_conn, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1349,5 +1690,247 @@ mod tests {
 
         let (_, count) = stats(&conn).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_keywords_empty() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        upsert_session(&conn, "s2", "proj", None).unwrap();
+
+        let sessions = filter_sessions_by_keywords(&conn, &[]).unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_keywords_match() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        insert_message(&conn, "s1", Some("u1"), "user", "rust async code", None).unwrap();
+        insert_message(&conn, "s1", Some("u2"), "assistant", "tokio spawn", None).unwrap();
+
+        upsert_session(&conn, "s2", "proj", None).unwrap();
+        insert_message(&conn, "s2", Some("u3"), "user", "python flask", None).unwrap();
+
+        let sessions =
+            filter_sessions_by_keywords(&conn, &["rust".to_string(), "tokio".to_string()]).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0], "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_keywords_no_match() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        insert_message(&conn, "s1", Some("u1"), "user", "python flask", None).unwrap();
+
+        let sessions = filter_sessions_by_keywords(&conn, &["rust".to_string()]).unwrap();
+        assert_eq!(sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_get_session_messages_for_wiki() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        insert_message(
+            &conn,
+            "s1",
+            Some("u1"),
+            "user",
+            "test message",
+            Some("2024-01-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        let messages = get_session_messages_for_wiki(&conn, "s1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "test message");
+    }
+
+    #[test]
+    fn test_get_latest_session_global() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", Some("2024-01-01T00:00:00Z")).unwrap();
+        upsert_session(&conn, "s2", "proj", Some("2024-06-15T12:00:00Z")).unwrap();
+        upsert_session(&conn, "s3", "proj", Some("2024-03-01T00:00:00Z")).unwrap();
+
+        let latest = get_latest_session(&conn, None).unwrap();
+        assert_eq!(latest, "s2");
+    }
+
+    #[test]
+    fn test_get_latest_session_empty_global() {
+        let (conn, _tmp) = setup_db();
+
+        let result = get_latest_session(&conn, None);
+        assert!(result.is_err());
+    }
+
+    // sessions.db tests
+    #[test]
+    fn test_open_sessions_db() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO current_sessions (project, session_id) VALUES ('test', 'session1')",
+                []
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn test_set_current_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        set_current_session(&conn, "project1", "session1").unwrap();
+
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM current_sessions WHERE project = 'project1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_id, "session1");
+    }
+
+    #[test]
+    fn test_set_current_session_update() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        set_current_session(&conn, "project1", "session1").unwrap();
+        set_current_session(&conn, "project1", "session2").unwrap();
+
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM current_sessions WHERE project = 'project1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_id, "session2");
+    }
+
+    #[test]
+    fn test_get_current_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO current_sessions (project, session_id) VALUES ('project1', 'session1')",
+            [],
+        )
+        .unwrap();
+
+        let session = get_current_session(&conn, "project1").unwrap();
+        assert_eq!(session, Some("session1".to_string()));
+
+        let missing = get_current_session(&conn, "project2").unwrap();
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn test_delete_current_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO current_sessions (project, session_id) VALUES ('project1', 'session1')",
+            [],
+        )
+        .unwrap();
+
+        delete_current_session(&conn, "project1").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM current_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_list_current_sessions() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        set_current_session(&conn, "project1", "session1").unwrap();
+        set_current_session(&conn, "project2", "session2").unwrap();
+
+        let sessions = list_current_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_get_latest_session_with_project() {
+        let tmp = NamedTempFile::new().unwrap();
+        let sessions_conn = Connection::open(tmp.path()).unwrap();
+        sessions_conn
+            .execute_batch(
+                "CREATE TABLE current_sessions (
+                    project TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+            )
+            .unwrap();
+
+        set_current_session(&sessions_conn, "my-project", "abc123").unwrap();
+
+        let result = get_latest_session(&sessions_conn, Some("my-project"));
+        assert!(result.is_err());
     }
 }
