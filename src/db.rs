@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -1374,12 +1376,14 @@ pub struct Message {
 // ============================================================================
 
 /// Get the sessions.db path
+#[allow(dead_code)]
 pub fn sessions_db_path() -> Result<PathBuf> {
     let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Failed to find data directory"))?;
     Ok(data_dir.join("claude-vault").join("sessions.db"))
 }
 
 /// Open or create sessions.db
+#[allow(dead_code)]
 pub fn open_sessions_db() -> Result<Connection> {
     let path = sessions_db_path()?;
     let conn = Connection::open(&path)
@@ -1399,6 +1403,7 @@ pub fn open_sessions_db() -> Result<Connection> {
 }
 
 /// Set current session for a project
+#[allow(dead_code)]
 pub fn set_current_session(conn: &Connection, project: &str, session_id: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO current_sessions (project, session_id) VALUES (?1, ?2)
@@ -1409,6 +1414,7 @@ pub fn set_current_session(conn: &Connection, project: &str, session_id: &str) -
 }
 
 /// Get current session for a project
+#[allow(dead_code)]
 pub fn get_current_session(conn: &Connection, project: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
@@ -1420,6 +1426,7 @@ pub fn get_current_session(conn: &Connection, project: &str) -> Result<Option<St
 }
 
 /// Delete current session for a project
+#[allow(dead_code)]
 pub fn delete_current_session(conn: &Connection, project: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM current_sessions WHERE project = ?1",
@@ -1429,6 +1436,7 @@ pub fn delete_current_session(conn: &Connection, project: &str) -> Result<()> {
 }
 
 /// List all current sessions
+#[allow(dead_code)]
 pub fn list_current_sessions(conn: &Connection) -> Result<Vec<(String, String)>> {
     let mut stmt =
         conn.prepare("SELECT project, session_id FROM current_sessions ORDER BY updated_at DESC")?;

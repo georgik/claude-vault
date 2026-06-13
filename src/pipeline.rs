@@ -2,6 +2,8 @@
 //!
 //! Ties all phases together: import → categorize → score → wiki → entities → synthesis → lint
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use rusqlite::Connection;
 

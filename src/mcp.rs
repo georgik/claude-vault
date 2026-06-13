@@ -16,10 +16,9 @@ use std::sync::Mutex;
 use claude_vault::db::{
     create_theme, delete_theme, find_entities, format_project_name, get_session_messages,
     get_synthesis_page, has_embeddings, list_categories, load_themes, open_db, resolve_session_id,
-    search, search_wiki, stats, wiki_stats, CategoryInfo, EntityInfo, SynthesisPage, Theme,
-    WikiSearchResult, WikiStats,
+    search, search_wiki, stats, wiki_stats,
 };
-use claude_vault::pipeline;
+use claude_vault::pipeline::{increment_themed_wiki, run_themed_pipeline, PipelineConfig};
 
 #[cfg(test)]
 use claude_vault::db::{insert_message, upsert_session};
@@ -47,6 +46,7 @@ enum MCPRequest {
     #[serde(rename = "tools/call")]
     ToolsCall { id: u64, params: ToolCallParams },
     #[serde(rename = "initialize")]
+    #[allow(dead_code)]
     Initialize { id: u64, params: serde_json::Value },
 }
 
@@ -77,6 +77,7 @@ struct GetSessionArgs {
 /// Tool arguments for get_context_stats
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 enum StatsArgs {
     WithSession { session_id: String },
     Global,
@@ -112,6 +113,39 @@ struct FindEntitiesArgs {
     theme_id: Option<String>,
 }
 
+/// Tool arguments for create_theme
+#[derive(Debug, Serialize, Deserialize)]
+struct CreateThemeArgs {
+    id: String,
+    name: String,
+    description: String,
+    keywords: Vec<String>,
+}
+
+/// Tool arguments for increment_theme
+#[derive(Debug, Serialize, Deserialize)]
+struct IncrementThemeArgs {
+    theme_id: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// Tool arguments for delete_theme
+#[derive(Debug, Serialize, Deserialize)]
+struct DeleteThemeArgs {
+    theme_id: String,
+}
+
+/// Tool arguments for rebuild_theme
+#[derive(Debug, Serialize, Deserialize)]
+struct RebuildThemeArgs {
+    theme_id: String,
+    #[serde(default = "default_min_quality")]
+    min_quality: u8,
+}
+
 /// MCP JSON-RPC 2.0 Response
 #[derive(Debug, Serialize)]
 struct MCPResponse {
@@ -123,23 +157,24 @@ struct MCPResponse {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum MCPResult {
-    Success { result: serde_json::Value, id: u64 },
-    Notification { result: serde_json::Value },
-    Error { error: MCPError, id: u64 },
+    Success {
+        result: serde_json::Value,
+        id: u64,
+    },
+    #[allow(dead_code)]
+    Notification {
+        result: serde_json::Value,
+    },
+    Error {
+        error: MCPError,
+        id: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
 struct MCPError {
     code: i32,
     message: String,
-}
-
-/// Tool definition for MCP
-#[derive(Debug, Serialize)]
-struct Tool {
-    name: &'static str,
-    description: &'static str,
-    input_schema: serde_json::Value,
 }
 
 /// Content item in MCP response
@@ -403,7 +438,7 @@ fn list_tools() -> serde_json::Value {
             },
             {
                 "name": "create_theme",
-                "description": "Create a new theme for domain-specific wiki projection.",
+                "description": "Create a new theme for domain-specific wiki projection. Automatically rebuilds the wiki from vault using the provided keywords.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -921,25 +956,31 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             }))
         }
         "create_theme" => {
-            #[derive(Deserialize)]
-            struct CreateThemeArgs {
-                id: String,
-                name: String,
-                description: String,
-                keywords: Vec<String>,
-            }
             let args: CreateThemeArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| anyhow!("Invalid arguments for create_theme: {}", e))?;
 
-            let theme = create_theme(args.id, args.name, args.description, args.keywords)?;
+            let theme = create_theme(args.id, args.name, args.description, args.keywords.clone())?;
+
+            // Auto-rebuild the theme wiki from vault
+            let vault_conn = get_connection()?;
+            let config = PipelineConfig {
+                min_quality: 3,
+                deduplicate: true,
+                fix_formatting: true,
+                generate_synthesis: true,
+                synthesis_limit: 10,
+            };
+            let stats = run_themed_pipeline(&vault_conn, &theme.id, &args.keywords, &config)?;
 
             let text = format!(
-                "Theme created:\n{} - {}\n  Description: {}\n  Keywords: {}\n  Wiki DB: {}",
+                "Theme created and wiki rebuilt:\n{} - {}\n  Description: {}\n  Keywords: {}\n  Wiki DB: {}\n  Sessions processed: {}\n  Wiki pages generated: {}",
                 theme.id,
                 theme.name,
                 theme.description,
                 theme.keywords.join(", "),
-                theme.wiki_db
+                theme.wiki_db,
+                stats.sessions_processed,
+                stats.wiki_pages_generated,
             );
 
             Ok(serde_json::json!({
@@ -950,10 +991,6 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             }))
         }
         "delete_theme" => {
-            #[derive(Deserialize)]
-            struct DeleteThemeArgs {
-                theme_id: String,
-            }
             let args: DeleteThemeArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| anyhow!("Invalid arguments for delete_theme: {}", e))?;
 
@@ -967,19 +1004,13 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             }))
         }
         "rebuild_theme" => {
-            #[derive(Deserialize)]
-            struct RebuildThemeArgs {
-                theme_id: String,
-                #[serde(default = "default_min_quality")]
-                min_quality: u8,
-            }
             let args: RebuildThemeArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| anyhow!("Invalid arguments for rebuild_theme: {}", e))?;
 
             let vault_conn = get_connection()?;
             let theme = claude_vault::db::get_theme(&args.theme_id)?;
 
-            let config = claude_vault::pipeline::PipelineConfig {
+            let config = PipelineConfig {
                 min_quality: args.min_quality,
                 deduplicate: true,
                 fix_formatting: true,
@@ -987,12 +1018,7 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
                 synthesis_limit: 10,
             };
 
-            let stats = claude_vault::pipeline::run_themed_pipeline(
-                &vault_conn,
-                &args.theme_id,
-                &theme.keywords,
-                &config,
-            )?;
+            let stats = run_themed_pipeline(&vault_conn, &args.theme_id, &theme.keywords, &config)?;
 
             let text = format!(
                 "Theme rebuilt: {}\nSessions processed: {}\nWiki pages generated: {}\nEntities extracted: {}\nSynthesis pages: {}",
@@ -1011,20 +1037,12 @@ fn handle_tool_call(name: &str, arguments: &serde_json::Value) -> Result<serde_j
             }))
         }
         "increment_theme" => {
-            #[derive(Deserialize)]
-            struct IncrementThemeArgs {
-                theme_id: String,
-                #[serde(default)]
-                session_id: Option<String>,
-                #[serde(default)]
-                project: Option<String>,
-            }
             let args: IncrementThemeArgs = serde_json::from_value(arguments.clone())
                 .map_err(|e| anyhow!("Invalid arguments for increment_theme: {}", e))?;
 
             let vault_conn = get_connection()?;
 
-            let stats = claude_vault::pipeline::increment_themed_wiki(
+            let stats = increment_themed_wiki(
                 &vault_conn,
                 &args.theme_id,
                 args.session_id.as_deref(),
@@ -1384,5 +1402,61 @@ mod tests {
     #[test]
     fn test_default_min_quality() {
         assert_eq!(default_min_quality(), 3);
+    }
+
+    #[test]
+    fn test_create_theme_args_parsing() {
+        let json = json!({
+            "id": "test-theme",
+            "name": "Test Theme",
+            "description": "A test theme for unit tests",
+            "keywords": ["test", "mock", "example"]
+        });
+        let parsed: CreateThemeArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.id, "test-theme");
+        assert_eq!(parsed.name, "Test Theme");
+        assert_eq!(parsed.description, "A test theme for unit tests");
+        assert_eq!(parsed.keywords, vec!["test", "mock", "example"]);
+    }
+
+    #[test]
+    fn test_create_theme_tool_schema_includes_auto_rebuild() {
+        let tools = list_tools();
+        let tools_obj = tools.as_object().unwrap();
+        let tools_array = tools_obj["tools"].as_array().unwrap();
+
+        let create_theme_tool = tools_array
+            .iter()
+            .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("create_theme"))
+            .expect("create_theme tool not found");
+
+        let description = create_theme_tool
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+
+        assert!(
+            description.contains("Automatically rebuilds"),
+            "create_theme description should mention auto-rebuild. Got: {}",
+            description
+        );
+    }
+
+    #[test]
+    fn test_increment_theme_args_with_project() {
+        let json = json!({"theme_id": "rust", "project": "user/my-project"});
+        let parsed: IncrementThemeArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.theme_id, "rust");
+        assert_eq!(parsed.project, Some("user/my-project".to_string()));
+        assert!(parsed.session_id.is_none());
+    }
+
+    #[test]
+    fn test_increment_theme_args_with_session_id() {
+        let json = json!({"theme_id": "rust", "session_id": "latest"});
+        let parsed: IncrementThemeArgs = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.theme_id, "rust");
+        assert_eq!(parsed.session_id, Some("latest".to_string()));
+        assert!(parsed.project.is_none());
     }
 }

@@ -459,7 +459,7 @@ Once connected, Claude Code can use these tools:
 | `get_wiki_stats` | Get wiki statistics including page count and quality metrics (supports themed wikis) |
 | `list_themes` | List all available themes for domain-specific wikis |
 | `get_theme` | Get details of a specific theme |
-| `create_theme` | Create a new theme for domain-specific wiki projection |
+| `create_theme` | Create a new theme for domain-specific wiki projection (automatically rebuilds from vault) |
 | `delete_theme` | Delete a theme and its wiki database |
 | `rebuild_theme` | Rebuild a themed wiki from vault (full projection) |
 | `increment_theme` | Incrementally update themed wiki with session (supports project-scoped resolution) |
@@ -470,22 +470,17 @@ Themes let you create domain-specific wiki projections from your vault. Instead 
 
 **Workflow:**
 
-1. Create a theme with keywords:
+1. Create a theme with keywords (automatically populates from vault):
 ```
 Create a theme for Rust development with keywords: rust, tokio, async, cargo
 ```
 
-2. Rebuild the themed wiki at session start:
-```
-Rebuild the rust theme wiki
-```
-
-3. Search the themed wiki during the session:
+2. Search the themed wiki during the session:
 ```
 Search the rust wiki for "tokio spawn"
 ```
 
-4. Update the wiki incrementally during the session:
+3. Update the wiki incrementally during the session:
 ```
 Increment the rust theme for project "my-app"
 ```

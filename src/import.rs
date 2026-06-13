@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
