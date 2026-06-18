@@ -191,6 +191,133 @@ claude-vault --db /path/to/vault.db search "query"  # custom database path
 
 </details>
 
+<details>
+<summary><h2>Wiki Generation</h2></summary>
+
+claude-vault can transform conversations into a structured knowledge base with quality scoring, categorization, and entity extraction.
+
+### Quick Start
+
+Generate wiki from all conversations:
+
+```bash
+# Run full pipeline (score + categorize + wiki + entities + synthesis)
+claude-vault pipeline
+
+# Generate wiki pages only
+claude-vault wiki --all
+
+# Export entire wiki to markdown files
+claude-vault wiki --export-all ~/wiki-export
+```
+
+### Wiki Commands
+
+```bash
+# Generate wiki for specific session
+claude-vault wiki --session 47cf1f2e --export page.md
+
+# Generate all wiki pages
+claude-vault wiki --all
+
+# Export all wiki pages to directory
+claude-vault wiki --export-all ~/wiki-export
+claude-vault wiki --export-all ~/wiki-export --min 4    # only high quality
+
+# Show top wiki pages by quality
+claude-vault wiki --top
+```
+
+### Export Directory Structure
+
+The `--export-all` option creates organized markdown files:
+
+```
+~/wiki-export/
+├── technology/
+│   ├── rust_async_error_handling.md
+│   └── docker_deployment_guide.md
+├── development/
+│   ├── testing_strategy.md
+│   └── code_review_checklist.md
+├── architecture/
+│   └── microservices_design.md
+└── general/
+    └── project_overview.md
+```
+
+Each file includes YAML frontmatter with metadata:
+
+```yaml
+---
+title: Rust Async Error Handling
+categories:
+- Technology
+- Rust Async
+tags:
+- rust
+- async
+- error-handling
+quality_score: 5
+created_at: 2026-06-10T19:59:34.962Z
+session_id: 65babf27-d613-4b3f-a7fa-490ac327a29a
+content_type: conversation
+---
+```
+
+### Full Pipeline
+
+The full pipeline processes conversations through multiple stages:
+
+```bash
+claude-vault pipeline
+# or with options:
+claude-vault pipeline --min-quality 4 --no-dedup --no-synthesis
+```
+
+Pipeline stages:
+1. **Categorization** — Auto-discovers categories from content
+2. **Quality Scoring** — Rates conversations 1-5 by technical depth, actionability, explanation quality
+3. **Wiki Generation** — Creates structured pages from high-quality sessions
+4. **Entity Extraction** — Identifies technologies, concepts, and patterns
+5. **Synthesis** — Generates summary pages combining related conversations
+6. **Lint** — Deduplicates pages and fixes formatting issues
+
+### Quality Scoring
+
+Conversations are scored on three dimensions:
+
+| Metric | Criteria |
+|--------|----------|
+| Technical Depth | Algorithms, optimization, patterns, async, concurrency, architecture |
+| Actionability | Step-by-step guidance, code examples, complete solutions |
+| Explanation Quality | Detail length, structure, reasoning indicators |
+
+### Other Wiki Features
+
+```bash
+# Score conversations without generating wiki
+claude-vault score --all
+claude-vault score --session 47cf1f2e
+
+# Categorize conversations
+claude-vault categorize --tree
+
+# Extract entities
+claude-vault entities --extract
+claude-vault entities --find rust
+
+# Generate synthesis pages
+claude-vault synthesize --top
+claude-vault synthesize --topic "rust"
+
+# Lint and clean wiki
+claude-vault lint --deduplicate
+claude-vault lint --fix
+```
+
+</details>
+
 ## Auto-archive with Claude Code Hooks
 
 Add to `~/.claude/settings.json`:
@@ -287,9 +414,135 @@ CREATE VIRTUAL TABLE messages_fts USING fts5(
 );
 ```
 
-Default database location: `~/.local/share/claude-vault/vault.db`
+Default database location varies by platform:
+- macOS: `~/Library/Application Support/claude-vault/vault.db`
+- Linux: `~/.local/share/claude-vault/vault.db`
+- Windows: `%APPDATA%\claude-vault\vault.db`
 
 SQLite is configured with WAL mode and a 5-second busy timeout for safe concurrent access.
+
+</details>
+
+<details>
+<summary><h2>MCP Server Integration</h2></summary>
+
+claude-vault includes an MCP (Model Context Protocol) server that lets Claude Code search your conversation history directly.
+
+### Installation
+
+Build or install claude-vault, then register the MCP server with Claude Code:
+
+```bash
+# Add MCP server for local project
+claude mcp add claude-vault -- claude-vault-mcp --db /path/to/vault.db
+
+# Add for all projects (user scope)
+# macOS: ~/Library/Application Support/claude-vault/vault.db
+# Linux: ~/.local/share/claude-vault/vault.db
+claude mcp add --scope user claude-vault -- claude-vault-mcp --db ~/.local/share/claude-vault/vault.db
+```
+
+### Available Tools
+
+Once connected, Claude Code can use these tools:
+
+| Tool | Description |
+|------|-------------|
+| `search_vault` | Full-text search through raw conversations using FTS5 syntax |
+| `search_wiki` | Search wiki pages for condensed, high-quality knowledge (supports themed wikis) |
+| `get_synthesis` | Get synthesis page combining related wiki pages on a topic (supports themed wikis) |
+| `get_session` | Retrieve all messages from a specific session by ID |
+| `get_context_stats` | Get token/message statistics for sessions or entire vault |
+| `find_similar` | Find messages semantically similar to a query (requires embeddings) |
+| `list_categories` | Browse all available categories in the wiki (supports themed wikis) |
+| `find_entities` | Find entities (technologies, concepts, tools) by name pattern (supports themed wikis) |
+| `get_wiki_stats` | Get wiki statistics including page count and quality metrics (supports themed wikis) |
+| `list_themes` | List all available themes for domain-specific wikis |
+| `get_theme` | Get details of a specific theme |
+| `create_theme` | Create a new theme for domain-specific wiki projection (automatically rebuilds from vault) |
+| `delete_theme` | Delete a theme and its wiki database |
+| `rebuild_theme` | Rebuild a themed wiki from vault (full projection) |
+| `increment_theme` | Incrementally update themed wiki with session (supports project-scoped resolution) |
+
+### Themed Wikis
+
+Themes let you create domain-specific wiki projections from your vault. Instead of searching all conversations, you can create focused wikis for specific topics like "rust", "embedded", or "ml".
+
+**Workflow:**
+
+1. Create a theme with keywords (automatically populates from vault):
+```
+Create a theme for Rust development with keywords: rust, tokio, async, cargo
+```
+
+2. Search the themed wiki during the session:
+```
+Search the rust wiki for "tokio spawn"
+```
+
+3. Update the wiki incrementally during the session:
+```
+Increment the rust theme for project "my-app"
+```
+
+**Architecture:**
+
+- **vault.db**: Immutable super-state with all historical knowledge
+- **sessions.db**: Mutable state tracking current sessions per project (enables parallel workflows)
+- **themed wikis**: Mutable, domain-specific projections (e.g., rust.db, embedded.db)
+- **Session workflow**: Full projection at start, incremental updates during session
+
+**Project-Scoped Sessions:**
+
+For parallel sessions across different projects, `increment_theme` supports project-scoped resolution:
+
+- **Global latest**: `session_id: "latest"` resolves to most recent session across all projects
+- **Project-scoped**: `project: "my-app"` resolves to current session for that specific project
+
+This enables multiple simultaneous sessions in different projects without conflicts.
+
+**Benefits:**
+
+- Focused search: Only relevant knowledge for your current project
+- Faster queries: Smaller, targeted databases
+- Cross-pollination: Discoveries from one session available in future themed wikis
+- Parallel workflows: Multiple projects can maintain separate session contexts
+
+### Usage in Claude Code
+
+After connecting the MCP server, ask Claude to search your knowledge base:
+
+```
+Search my wiki for "rust async error handling"
+What did we discuss about docker deployment?
+Show me the synthesis for "docker containers"
+List all available categories
+What are my wiki statistics?
+```
+
+### Verify Connection
+
+Check MCP server status:
+
+```bash
+claude mcp list
+claude mcp get claude-vault
+```
+
+### Troubleshooting
+
+If the server shows "Failed to connect":
+
+1. **Verify database path**: Ensure the database file exists and is readable
+2. **Check server binary**: `claude-vault-mcp` must be in your PATH or use full path
+3. **Test manually**: `echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | claude-vault-mcp --db /path/to/vault.db`
+4. **Increase timeout**: `MCP_TIMEOUT=60000 claude` for slower databases
+
+### Remove Server
+
+```bash
+claude mcp remove claude-vault
+```
 
 </details>
 

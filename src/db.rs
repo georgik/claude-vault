@@ -1,6 +1,9 @@
-use anyhow::{Context, Result};
+#![allow(dead_code)]
+
+use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Convert project directory names like "-home-murou-ghq-github-com-user-repo" to "user/repo"
 pub fn format_project_name(raw: &str) -> String {
@@ -69,6 +72,39 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     // Create FTS table with Porter stemming, or migrate from old schema
     migrate_fts(conn)?;
+
+    // Create embeddings table for semantic search
+    init_embeddings(conn)?;
+
+    // Create wiki pages table with FTS5
+    init_wiki_tables(conn)?;
+
+    // Create category tables for wiki generation
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            parent_id INTEGER,
+            description TEXT,
+            document_count INTEGER DEFAULT 0,
+            FOREIGN KEY (parent_id) REFERENCES categories(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories(parent_id);
+
+        CREATE TABLE IF NOT EXISTS message_categories (
+            message_id INTEGER,
+            category_id INTEGER,
+            confidence REAL,
+            PRIMARY KEY (message_id, category_id),
+            FOREIGN KEY (message_id) REFERENCES messages(id),
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_msgcat_category ON message_categories(category_id);
+        ",
+    )?;
 
     conn.execute_batch(
         "
@@ -601,6 +637,830 @@ pub fn verify(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Initialize embeddings table for semantic search
+fn init_embeddings(conn: &Connection) -> Result<()> {
+    let embeddings_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings')",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if !embeddings_exists {
+        conn.execute_batch(
+            "
+            CREATE TABLE embeddings (
+                message_id INTEGER PRIMARY KEY,
+                embedding TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX idx_embeddings_message ON embeddings(message_id);
+            ",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Initialize wiki tables with FTS5 support
+fn init_wiki_tables(conn: &Connection) -> Result<()> {
+    // Create base wiki_pages table (matches wiki.rs schema)
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS wiki_pages (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            frontmatter TEXT NOT NULL,
+            content TEXT NOT NULL,
+            quality_score INTEGER,
+            created_at TEXT,
+            categories TEXT,
+            tags TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_wiki_quality ON wiki_pages(quality_score);
+        CREATE INDEX IF NOT EXISTS idx_wiki_categories ON wiki_pages(categories);
+        ",
+    )?;
+
+    // Create synthesis_pages table
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS synthesis_pages (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            key_points TEXT,
+            entities TEXT,
+            related_topics TEXT,
+            sources TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_synthesis_topic ON synthesis_pages(topic);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Store embedding for a message
+#[allow(dead_code)]
+pub fn store_embedding(conn: &Connection, message_id: i64, embedding: &[f32]) -> Result<()> {
+    let embedding_json = serde_json::to_string(embedding)?;
+    conn.execute(
+        "INSERT INTO embeddings (message_id, embedding) VALUES (?1, ?2)
+         ON CONFLICT(message_id) DO UPDATE SET embedding = excluded.embedding",
+        params![message_id, embedding_json],
+    )?;
+    Ok(())
+}
+
+/// Get embedding for a message
+#[allow(dead_code)]
+pub fn get_embedding(conn: &Connection, message_id: i64) -> Result<Option<Vec<f32>>> {
+    let result: Option<String> = conn
+        .query_row(
+            "SELECT embedding FROM embeddings WHERE message_id = ?1",
+            params![message_id],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match result {
+        Some(json) => {
+            let vec: Vec<f32> = serde_json::from_str(&json)?;
+            Ok(Some(vec))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Cosine similarity between two vectors
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot / (norm_a * norm_b)
+}
+
+/// Result from semantic search
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SemanticSearchResult {
+    pub message_id: i64,
+    pub session_id: String,
+    pub project: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub score: f32,
+}
+
+/// Semantic search using embeddings
+/// Returns messages similar to the query embedding, sorted by similarity
+#[allow(dead_code)]
+pub fn semantic_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+    project_filter: Option<&str>,
+    role_filter: Option<&str>,
+) -> Result<Vec<SemanticSearchResult>> {
+    // Get all messages that have embeddings
+    let sql = if project_filter.is_some() {
+        "SELECT m.id, m.session_id, s.project, m.role, m.content, m.timestamp, e.embedding
+         FROM messages m
+         JOIN sessions s ON s.session_id = m.session_id
+         JOIN embeddings e ON e.message_id = m.id
+         WHERE s.project LIKE ?1"
+    } else {
+        "SELECT m.id, m.session_id, s.project, m.role, m.content, m.timestamp, e.embedding
+         FROM messages m
+         JOIN sessions s ON s.session_id = m.session_id
+         JOIN embeddings e ON e.message_id = m.id"
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+
+    let rows: Vec<(i64, String, String, String, String, Option<String>, String)> =
+        if let Some(proj) = project_filter {
+            let normalized = format!("%{}%", proj.replace('/', "-"));
+            stmt.query_map(params![normalized], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+
+    // Calculate similarity scores
+    let mut results: Vec<SemanticSearchResult> = rows
+        .into_iter()
+        .filter_map(
+            |(msg_id, session_id, project, role, content, timestamp, emb_json)| {
+                let embedding: Vec<f32> = serde_json::from_str(&emb_json).ok()?;
+                let score = cosine_similarity(query_embedding, &embedding);
+
+                // Filter by role if specified
+                if let Some(ref role_filter) = role_filter {
+                    if role.as_str() != *role_filter {
+                        return None;
+                    }
+                }
+
+                Some(SemanticSearchResult {
+                    message_id: msg_id,
+                    session_id,
+                    project,
+                    role,
+                    content,
+                    timestamp,
+                    score,
+                })
+            },
+        )
+        .collect();
+
+    // Sort by score (highest first)
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+
+    // Apply limit
+    results.truncate(limit);
+
+    Ok(results)
+}
+
+/// Check if embeddings have been generated
+#[allow(dead_code)]
+pub fn has_embeddings(conn: &Connection) -> Result<bool> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))?;
+    Ok(count > 0)
+}
+
+/// Get count of embeddings
+#[allow(dead_code)]
+pub fn embedding_count(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+// ============================================================================
+// Wiki search functions
+// ============================================================================
+
+/// Result from wiki search
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct WikiSearchResult {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub quality_score: i32,
+    pub categories: Vec<String>,
+    pub tags: Vec<String>,
+    pub session_id: String,
+}
+
+/// Search wiki pages using full-text search
+#[allow(dead_code)]
+pub fn search_wiki(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    min_quality: Option<u8>,
+) -> Result<Vec<WikiSearchResult>> {
+    let limit = limit.min(100);
+
+    // Build WHERE clause
+    let mut where_clauses = vec!["1=1".to_string()];
+    if let Some(min_q) = min_quality {
+        where_clauses.push(format!("quality_score >= {}", min_q));
+    }
+
+    // Add content search using LIKE (simplified, can add FTS5 later)
+    where_clauses.push(format!("(content LIKE '%{query}%' OR title LIKE '%{query}%' OR categories LIKE '%{query}%' OR tags LIKE '%{query}%')",
+        query = query.replace('\'', "''")));
+
+    let sql = format!(
+        "SELECT id, title, content, quality_score, categories, tags
+         FROM wiki_pages
+         WHERE {}
+         ORDER BY quality_score DESC
+         LIMIT {limit}",
+        where_clauses.join(" AND ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows: Vec<(String, String, String, i32, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let results: Vec<WikiSearchResult> = rows
+        .into_iter()
+        .map(
+            |(id, title, content, quality_score, categories_json, tags_json)| {
+                let categories: Vec<String> =
+                    serde_json::from_str(&categories_json).unwrap_or_default();
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+
+                WikiSearchResult {
+                    id: id.clone(),
+                    title,
+                    content,
+                    quality_score,
+                    categories,
+                    tags,
+                    session_id: id,
+                }
+            },
+        )
+        .collect();
+
+    Ok(results)
+}
+
+/// Get synthesis page by topic
+#[allow(dead_code)]
+pub fn get_synthesis_page(conn: &Connection, topic: &str) -> Result<Option<SynthesisPage>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, topic, summary, key_points, entities, related_topics, sources
+         FROM synthesis_pages
+         WHERE topic = ?1",
+    )?;
+
+    let result = stmt
+        .query_row(params![topic], |row| {
+            let key_points: String = row.get(4)?;
+            let entities: String = row.get(5)?;
+            let related: String = row.get(6)?;
+            let sources: String = row.get(7)?;
+
+            Ok(SynthesisPage {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                topic: row.get(2)?,
+                summary: row.get(3)?,
+                key_points: serde_json::from_str(&key_points).unwrap_or_default(),
+                entities: serde_json::from_str(&entities).unwrap_or_default(),
+                related_topics: serde_json::from_str(&related).unwrap_or_default(),
+                sources: serde_json::from_str(&sources).unwrap_or_default(),
+            })
+        })
+        .ok();
+
+    Ok(result)
+}
+
+/// Synthesis page structure
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct SynthesisPage {
+    pub id: String,
+    pub title: String,
+    pub topic: String,
+    pub summary: String,
+    pub key_points: Vec<String>,
+    pub entities: Vec<String>,
+    pub related_topics: Vec<String>,
+    pub sources: Vec<String>,
+}
+
+/// List all available categories
+#[allow(dead_code)]
+pub fn list_categories(conn: &Connection) -> Result<Vec<CategoryInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, document_count
+         FROM categories
+         ORDER BY document_count DESC",
+    )?;
+
+    let categories = stmt
+        .query_map([], |row| {
+            Ok(CategoryInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                document_count: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(categories)
+}
+
+/// Category information
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct CategoryInfo {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub document_count: i64,
+}
+
+/// Find entities by name pattern
+#[allow(dead_code)]
+pub fn find_entities(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<EntityInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, entity_type, COUNT(*) as mention_count
+         FROM entities
+         WHERE name LIKE ?1
+         GROUP BY id
+         ORDER BY mention_count DESC
+         LIMIT ?2",
+    )?;
+
+    let entities = stmt
+        .query_map(params![format!("%{}%", pattern), limit as i64], |row| {
+            Ok(EntityInfo {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                entity_type: row.get(2)?,
+                mention_count: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(entities)
+}
+
+/// Entity information
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct EntityInfo {
+    pub id: i64,
+    pub name: String,
+    pub entity_type: String,
+    pub mention_count: i64,
+}
+
+/// Get wiki statistics
+#[allow(dead_code)]
+pub fn wiki_stats(conn: &Connection) -> Result<WikiStats> {
+    let page_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM wiki_pages", [], |row| row.get(0))?;
+    let synthesis_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM synthesis_pages", [], |row| row.get(0))?;
+    let category_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM categories", [], |row| row.get(0))?;
+    let entity_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get(0))?;
+
+    let avg_quality: f64 = conn
+        .query_row(
+            "SELECT AVG(quality_score) FROM wiki_pages WHERE quality_score > 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    Ok(WikiStats {
+        page_count,
+        synthesis_count,
+        category_count,
+        entity_count,
+        avg_quality,
+    })
+}
+
+/// Wiki statistics
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct WikiStats {
+    pub page_count: i64,
+    pub synthesis_count: i64,
+    pub category_count: i64,
+    pub entity_count: i64,
+    pub avg_quality: f64,
+}
+
+// ============================================================================
+// Theme support for themed wikis
+// ============================================================================
+
+/// Theme for domain-specific wiki projection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Theme {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub keywords: Vec<String>,
+    pub wiki_db: String,
+    pub created_at: String,
+    pub entry_count: i64,
+}
+
+/// Theme registry loaded from themes.json
+#[derive(Debug, Serialize, Deserialize)]
+struct ThemeRegistry {
+    themes: Vec<Theme>,
+    #[serde(default)]
+    default_theme: Option<String>,
+}
+
+/// Get the wiki directory path
+pub fn wiki_dir() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Failed to find data directory"))?;
+    Ok(data_dir.join("claude-vault").join("wiki"))
+}
+
+/// Get the themes.json path
+pub fn themes_json_path() -> Result<PathBuf> {
+    Ok(wiki_dir()?.join("themes.json"))
+}
+
+/// Ensure wiki directory exists
+pub fn ensure_wiki_dir() -> Result<()> {
+    let dir = wiki_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create wiki directory: {}", dir.display()))?;
+    Ok(())
+}
+
+/// Load all themes from themes.json
+#[allow(dead_code)]
+pub fn load_themes() -> Result<Vec<Theme>> {
+    let path = themes_json_path()?;
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read themes.json: {}", path.display()))?;
+
+    let registry: ThemeRegistry = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse themes.json: {}", path.display()))?;
+
+    Ok(registry.themes)
+}
+
+/// Save themes to themes.json
+fn save_themes(themes: &[Theme]) -> Result<()> {
+    ensure_wiki_dir()?;
+
+    let path = themes_json_path()?;
+    let registry = ThemeRegistry {
+        themes: themes.to_vec(),
+        default_theme: None,
+    };
+
+    let content =
+        serde_json::to_string_pretty(&registry).with_context(|| "Failed to serialize themes")?;
+
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write themes.json: {}", path.display()))?;
+
+    Ok(())
+}
+
+/// Get theme by ID
+#[allow(dead_code)]
+pub fn get_theme(id: &str) -> Result<Theme> {
+    let themes = load_themes()?;
+    themes
+        .into_iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| anyhow!("Theme not found: {}", id))
+}
+
+/// Create a new theme
+#[allow(dead_code)]
+pub fn create_theme(
+    id: String,
+    name: String,
+    description: String,
+    keywords: Vec<String>,
+) -> Result<Theme> {
+    // Validate ID is slug-like
+    if !id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("Invalid theme ID: must contain only letters, numbers, hyphens, underscores");
+    }
+
+    // Check for duplicate
+    let themes = load_themes()?;
+    if themes.iter().any(|t| t.id == id) {
+        bail!("Theme already exists: {}", id);
+    }
+
+    ensure_wiki_dir()?;
+
+    let wiki_db = format!("{}/{}.db", wiki_dir()?.display(), id);
+
+    let theme = Theme {
+        id: id.clone(),
+        name,
+        description,
+        keywords,
+        wiki_db,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        entry_count: 0,
+    };
+
+    let mut updated_themes = themes;
+    updated_themes.push(theme.clone());
+    save_themes(&updated_themes)?;
+
+    Ok(theme)
+}
+
+/// Delete a theme
+#[allow(dead_code)]
+pub fn delete_theme(id: &str) -> Result<()> {
+    let themes = load_themes()?;
+    let theme = themes
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| anyhow!("Theme not found: {}", id))?;
+
+    // Delete wiki database
+    let db_path = PathBuf::from(&theme.wiki_db);
+    if db_path.exists() {
+        std::fs::remove_file(&db_path)
+            .with_context(|| format!("Failed to delete wiki database: {}", db_path.display()))?;
+    }
+
+    // Remove from registry
+    let updated_themes: Vec<_> = themes.into_iter().filter(|t| t.id != id).collect();
+    save_themes(&updated_themes)?;
+
+    Ok(())
+}
+
+/// Get wiki database path for a theme
+#[allow(dead_code)]
+pub fn theme_wiki_path(theme_id: &str) -> Result<PathBuf> {
+    let theme = get_theme(theme_id)?;
+    Ok(PathBuf::from(theme.wiki_db))
+}
+
+/// Open wiki database for a theme
+#[allow(dead_code)]
+pub fn open_theme_wiki(theme_id: &str) -> Result<Connection> {
+    let db_path = theme_wiki_path(theme_id)?;
+    if !db_path.exists() {
+        bail!(
+            "Theme wiki database not found: {}. Run rebuild_theme first.",
+            db_path.display()
+        );
+    }
+    open_db(&db_path)
+}
+
+/// Get default wiki database path (wiki.db)
+pub fn default_wiki_path() -> Result<PathBuf> {
+    Ok(wiki_dir()?.join("wiki.db"))
+}
+
+/// Open default wiki database
+#[allow(dead_code)]
+pub fn open_default_wiki() -> Result<Connection> {
+    let db_path = default_wiki_path()?;
+    open_db(&db_path)
+}
+
+/// Filter sessions by keywords using FTS5
+/// Returns session IDs that match any of the keywords
+#[allow(dead_code)]
+pub fn filter_sessions_by_keywords(conn: &Connection, keywords: &[String]) -> Result<Vec<String>> {
+    if keywords.is_empty() {
+        // Return all sessions if no keywords
+        let mut stmt = conn.prepare("SELECT DISTINCT session_id FROM sessions")?;
+        let result = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(result);
+    }
+
+    // Build FTS5 query with OR between keywords
+    let query = keywords
+        .iter()
+        .map(|k| format!("\"{}\"", k.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let sql = "
+        SELECT DISTINCT m.session_id
+        FROM messages_fts f
+        JOIN messages m ON m.id = f.rowid
+        WHERE messages_fts MATCH ?1
+    ";
+
+    let mut stmt = conn.prepare(sql)?;
+    let session_ids: Vec<String> = stmt
+        .query_map(params![query], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(session_ids)
+}
+
+/// Get messages for a specific session
+#[allow(dead_code)]
+pub fn get_session_messages_for_wiki(conn: &Connection, session_id: &str) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, role, content, timestamp
+         FROM messages
+         WHERE session_id = ?1
+         ORDER BY id",
+    )?;
+
+    let messages = stmt
+        .query_map(params![session_id], |row| {
+            Ok(Message {
+                id: row.get(0)?,
+                role: row.get(1)?,
+                content: row.get(2)?,
+                timestamp: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(messages)
+}
+
+/// Message structure for wiki generation
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Message {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+}
+
+// ============================================================================
+// Current session tracking for parallel project sessions
+// ============================================================================
+
+/// Get the sessions.db path
+#[allow(dead_code)]
+pub fn sessions_db_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().ok_or_else(|| anyhow!("Failed to find data directory"))?;
+    Ok(data_dir.join("claude-vault").join("sessions.db"))
+}
+
+/// Open or create sessions.db
+#[allow(dead_code)]
+pub fn open_sessions_db() -> Result<Connection> {
+    let path = sessions_db_path()?;
+    let conn = Connection::open(&path)
+        .with_context(|| format!("Failed to open sessions database: {}", path.display()))?;
+
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA busy_timeout=5000;
+         CREATE TABLE IF NOT EXISTS current_sessions (
+             project TEXT PRIMARY KEY,
+             session_id TEXT NOT NULL,
+             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+
+    Ok(conn)
+}
+
+/// Set current session for a project
+#[allow(dead_code)]
+pub fn set_current_session(conn: &Connection, project: &str, session_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO current_sessions (project, session_id) VALUES (?1, ?2)
+         ON CONFLICT(project) DO UPDATE SET session_id=excluded.session_id, updated_at=datetime('now')",
+        params![project, session_id],
+    )?;
+    Ok(())
+}
+
+/// Get current session for a project
+#[allow(dead_code)]
+pub fn get_current_session(conn: &Connection, project: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT session_id FROM current_sessions WHERE project = ?1",
+            params![project],
+            |row| row.get(0),
+        )
+        .ok())
+}
+
+/// Delete current session for a project
+#[allow(dead_code)]
+pub fn delete_current_session(conn: &Connection, project: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM current_sessions WHERE project = ?1",
+        params![project],
+    )?;
+    Ok(())
+}
+
+/// List all current sessions
+#[allow(dead_code)]
+pub fn list_current_sessions(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT project, session_id FROM current_sessions ORDER BY updated_at DESC")?;
+
+    let sessions = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(sessions)
+}
+
+/// Get latest session ID
+/// If project is None, returns global most recent from vault
+/// If project is Some, resolves to that project's current session via sessions.db
+pub fn get_latest_session(vault_conn: &Connection, project: Option<&str>) -> Result<String> {
+    if let Some(proj) = project {
+        let sessions_conn = open_sessions_db()?;
+        get_current_session(&sessions_conn, proj)?
+            .ok_or_else(|| anyhow!("No current session for project: {}", proj))
+    } else {
+        nth_recent_session_id(vault_conn, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +1698,247 @@ mod tests {
 
         let (_, count) = stats(&conn).unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_keywords_empty() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        upsert_session(&conn, "s2", "proj", None).unwrap();
+
+        let sessions = filter_sessions_by_keywords(&conn, &[]).unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_sessions_by_keywords_match() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        insert_message(&conn, "s1", Some("u1"), "user", "rust async code", None).unwrap();
+        insert_message(&conn, "s1", Some("u2"), "assistant", "tokio spawn", None).unwrap();
+
+        upsert_session(&conn, "s2", "proj", None).unwrap();
+        insert_message(&conn, "s2", Some("u3"), "user", "python flask", None).unwrap();
+
+        let sessions =
+            filter_sessions_by_keywords(&conn, &["rust".to_string(), "tokio".to_string()]).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0], "s1");
+    }
+
+    #[test]
+    fn test_filter_sessions_by_keywords_no_match() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        insert_message(&conn, "s1", Some("u1"), "user", "python flask", None).unwrap();
+
+        let sessions = filter_sessions_by_keywords(&conn, &["rust".to_string()]).unwrap();
+        assert_eq!(sessions.len(), 0);
+    }
+
+    #[test]
+    fn test_get_session_messages_for_wiki() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", None).unwrap();
+        insert_message(
+            &conn,
+            "s1",
+            Some("u1"),
+            "user",
+            "test message",
+            Some("2024-01-01T00:00:00Z"),
+        )
+        .unwrap();
+
+        let messages = get_session_messages_for_wiki(&conn, "s1").unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].content, "test message");
+    }
+
+    #[test]
+    fn test_get_latest_session_global() {
+        let (conn, _tmp) = setup_db();
+        upsert_session(&conn, "s1", "proj", Some("2024-01-01T00:00:00Z")).unwrap();
+        upsert_session(&conn, "s2", "proj", Some("2024-06-15T12:00:00Z")).unwrap();
+        upsert_session(&conn, "s3", "proj", Some("2024-03-01T00:00:00Z")).unwrap();
+
+        let latest = get_latest_session(&conn, None).unwrap();
+        assert_eq!(latest, "s2");
+    }
+
+    #[test]
+    fn test_get_latest_session_empty_global() {
+        let (conn, _tmp) = setup_db();
+
+        let result = get_latest_session(&conn, None);
+        assert!(result.is_err());
+    }
+
+    // sessions.db tests
+    #[test]
+    fn test_open_sessions_db() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO current_sessions (project, session_id) VALUES ('test', 'session1')",
+                []
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn test_set_current_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        set_current_session(&conn, "project1", "session1").unwrap();
+
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM current_sessions WHERE project = 'project1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_id, "session1");
+    }
+
+    #[test]
+    fn test_set_current_session_update() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        set_current_session(&conn, "project1", "session1").unwrap();
+        set_current_session(&conn, "project1", "session2").unwrap();
+
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM current_sessions WHERE project = 'project1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_id, "session2");
+    }
+
+    #[test]
+    fn test_get_current_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO current_sessions (project, session_id) VALUES ('project1', 'session1')",
+            [],
+        )
+        .unwrap();
+
+        let session = get_current_session(&conn, "project1").unwrap();
+        assert_eq!(session, Some("session1".to_string()));
+
+        let missing = get_current_session(&conn, "project2").unwrap();
+        assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn test_delete_current_session() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO current_sessions (project, session_id) VALUES ('project1', 'session1')",
+            [],
+        )
+        .unwrap();
+
+        delete_current_session(&conn, "project1").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM current_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_list_current_sessions() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE current_sessions (
+                project TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .unwrap();
+
+        set_current_session(&conn, "project1", "session1").unwrap();
+        set_current_session(&conn, "project2", "session2").unwrap();
+
+        let sessions = list_current_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_get_latest_session_with_project() {
+        let tmp = NamedTempFile::new().unwrap();
+        let sessions_conn = Connection::open(tmp.path()).unwrap();
+        sessions_conn
+            .execute_batch(
+                "CREATE TABLE current_sessions (
+                    project TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );",
+            )
+            .unwrap();
+
+        set_current_session(&sessions_conn, "my-project", "abc123").unwrap();
+
+        let result = get_latest_session(&sessions_conn, Some("my-project"));
+        assert!(result.is_err());
     }
 }
