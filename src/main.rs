@@ -103,11 +103,39 @@ enum Commands {
     Stats,
     /// Verify database integrity
     Verify,
+    /// Analyze conversations for command rejection patterns
+    Analyze {
+        /// Analysis type to run
+        #[arg(default_value = "rejections")]
+        mode: AnalyzeMode,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Only analyze sessions after this date
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of results per category
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         shell: Shell,
     },
+}
+
+#[derive(Clone, Default, ValueEnum)]
+enum AnalyzeMode {
+    /// Extract user message rejection patterns
+    #[default]
+    Rejections,
+    /// Extract tool preference patterns (Read/Edit vs bash)
+    ToolPreferences,
+    /// Extract command mentions in user messages
+    Commands,
+    /// Full analysis with categorization
+    Full,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -426,6 +454,14 @@ fn run() -> Result<()> {
         }
         Commands::Verify => {
             db::verify(&conn)?;
+        }
+        Commands::Analyze { mode, json, since, limit } => {
+            let results = db::analyze(&conn, mode.clone(), since.as_deref(), limit)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            } else {
+                db::print_analysis(&results, mode);
+            }
         }
         Commands::Completions { .. } => unreachable!(),
     }

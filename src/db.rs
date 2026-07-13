@@ -601,6 +601,470 @@ pub fn verify(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// =============================================================================
+// Analysis Functions for DCG Pattern Discovery
+// =============================================================================
+
+use crate::AnalyzeMode;
+
+#[derive(Debug, serde::Serialize)]
+pub struct AnalysisResult {
+    pub mode: String,
+    pub total_analyzed: usize,
+    pub patterns_found: Vec<Pattern>,
+    pub summary: AnalysisSummary,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Pattern {
+    pub category: String,
+    pub pattern_type: String,
+    pub excerpt: String,
+    pub session_id: String,
+    pub frequency: usize,
+    pub suggested_regex: Option<String>,
+    pub explanation: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AnalysisSummary {
+    pub rejection_indicators: Vec<String>,
+    pub tool_preferences: Vec<String>,
+    pub command_families: Vec<String>,
+}
+
+pub fn analyze(
+    conn: &Connection,
+    mode: AnalyzeMode,
+    since: Option<&str>,
+    limit: usize,
+) -> Result<AnalysisResult> {
+    let since_clause = if let Some(date) = since {
+        format!("AND timestamp >= '{date}'")
+    } else {
+        String::new()
+    };
+
+    let result = match mode {
+        AnalyzeMode::Rejections => analyze_rejections(conn, &since_clause, limit)?,
+        AnalyzeMode::ToolPreferences => analyze_tool_preferences(conn, &since_clause, limit)?,
+        AnalyzeMode::Commands => analyze_commands(conn, &since_clause, limit)?,
+        AnalyzeMode::Full => analyze_full(conn, &since_clause, limit)?,
+    };
+
+    Ok(result)
+}
+
+fn analyze_rejections(
+    conn: &Connection,
+    since_clause: &str,
+    limit: usize,
+) -> Result<AnalysisResult> {
+    let query = format!(
+        "SELECT session_id, content FROM messages
+         WHERE role = 'user' {since_clause}
+           AND (
+             content LIKE '%should not use%'
+             OR content LIKE '%shouldn''t use%'
+             OR content LIKE '%don''t use%'
+             OR content LIKE '%dont use%'
+             OR content LIKE '%avoid using%'
+             OR content LIKE '%leads into troubles%'
+             OR content LIKE '%causes problems%'
+             OR content LIKE '%breaks things%'
+             OR content LIKE '%instead of%'
+             OR content LIKE '%rather than%'
+           )
+         ORDER BY timestamp DESC
+         LIMIT {limit}"
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let patterns: Vec<Pattern> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .enumerate()
+        .map(|(_i, (session_id, content))| {
+            let (category, pattern_type, suggested_regex, explanation) = categorize_rejection(&content);
+            Pattern {
+                category,
+                pattern_type,
+                excerpt: content.chars().take(200).collect(),
+                session_id,
+                frequency: 1,
+                suggested_regex,
+                explanation,
+            }
+        })
+        .collect();
+
+    let total = patterns.len();
+
+    Ok(AnalysisResult {
+        mode: "rejections".to_string(),
+        total_analyzed: total,
+        patterns_found: patterns,
+        summary: AnalysisSummary {
+            rejection_indicators: vec![
+                "should not use".to_string(),
+                "don't use".to_string(),
+                "avoid".to_string(),
+                "instead of".to_string(),
+                "leads into troubles".to_string(),
+            ],
+            tool_preferences: vec![],
+            command_families: vec![],
+        },
+    })
+}
+
+fn analyze_tool_preferences(
+    conn: &Connection,
+    since_clause: &str,
+    limit: usize,
+) -> Result<AnalysisResult> {
+    let query = format!(
+        "SELECT session_id, content FROM messages
+         WHERE role = 'user' {since_clause}
+           AND (
+             content LIKE '%use Read instead%'
+             OR content LIKE '%use Edit instead%'
+             OR content LIKE '%use native tool%'
+             OR content LIKE '%use the Read tool%'
+             OR content LIKE '%use the Edit tool%'
+             OR content LIKE '%prefer using%'
+           )
+         ORDER BY timestamp DESC
+         LIMIT {limit}"
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let patterns: Vec<Pattern> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .map(|(session_id, content)| {
+            let excerpt = content.chars().take(200).collect();
+            Pattern {
+                category: "tool-preference".to_string(),
+                pattern_type: extract_tool_preference(&content),
+                excerpt,
+                session_id,
+                frequency: 1,
+                suggested_regex: None,
+                explanation: Some("Use native Read/Edit tools instead of bash commands".to_string()),
+            }
+        })
+        .collect();
+
+    Ok(AnalysisResult {
+        mode: "tool-preferences".to_string(),
+        total_analyzed: patterns.len(),
+        patterns_found: patterns,
+        summary: AnalysisSummary {
+            rejection_indicators: vec![],
+            tool_preferences: vec![
+                "use Read instead".to_string(),
+                "use Edit instead".to_string(),
+                "use native tool".to_string(),
+            ],
+            command_families: vec![],
+        },
+    })
+}
+
+fn analyze_commands(
+    conn: &Connection,
+    since_clause: &str,
+    limit: usize,
+) -> Result<AnalysisResult> {
+    let query = format!(
+        "SELECT session_id, content FROM messages
+         WHERE role = 'user' {since_clause}
+           AND (
+             content LIKE '%`%'
+             OR content LIKE '%git add%'
+             OR content LIKE '%git commit%'
+             OR content LIKE '%rm -rf%'
+             OR content LIKE '%timeout%'
+             OR content LIKE '%kill%'
+             OR content LIKE '%pkill%'
+             OR content LIKE '%cat %'
+             OR content LIKE '%sed %'
+           )
+         ORDER BY timestamp DESC
+         LIMIT {limit}"
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let patterns: Vec<Pattern> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })?
+        .filter_map(Result::ok)
+        .map(|(session_id, content)| {
+            let commands = extract_commands(&content);
+            let excerpt = content.chars().take(200).collect();
+            Pattern {
+                category: "command-mention".to_string(),
+                pattern_type: commands.clone().join(", "),
+                excerpt,
+                session_id,
+                frequency: 1,
+                suggested_regex: Some(commands_to_regex(&commands)),
+                explanation: None,
+            }
+        })
+        .collect();
+
+    Ok(AnalysisResult {
+        mode: "commands".to_string(),
+        total_analyzed: patterns.len(),
+        patterns_found: patterns,
+        summary: AnalysisSummary {
+            rejection_indicators: vec![],
+            tool_preferences: vec![],
+            command_families: vec![
+                "git add".to_string(),
+                "timeout".to_string(),
+                "kill/pkill".to_string(),
+                "cat/sed".to_string(),
+            ],
+        },
+    })
+}
+
+fn analyze_full(
+    conn: &Connection,
+    since_clause: &str,
+    limit: usize,
+) -> Result<AnalysisResult> {
+    // Combine all analysis modes
+    let mut all_patterns = Vec::new();
+
+    let rejections = analyze_rejections(conn, since_clause, limit)?;
+    all_patterns.extend(rejections.patterns_found);
+
+    let tools = analyze_tool_preferences(conn, since_clause, limit)?;
+    all_patterns.extend(tools.patterns_found);
+
+    let commands = analyze_commands(conn, since_clause, limit)?;
+    all_patterns.extend(commands.patterns_found);
+
+    // Group by pattern type and count frequency
+    let mut freq_map: std::collections::HashMap<String, (usize, Pattern)> = std::collections::HashMap::new();
+    for pattern in all_patterns {
+        let key = format!("{}:{}", pattern.category, pattern.pattern_type);
+        let entry = freq_map.entry(key).or_insert((0, pattern));
+        entry.0 += 1;
+        entry.1.frequency = entry.0;
+    }
+
+    let mut patterns: Vec<Pattern> = freq_map.into_values().map(|(_, p)| p).collect();
+    patterns.sort_by(|a, b| b.frequency.cmp(&a.frequency));
+
+    Ok(AnalysisResult {
+        mode: "full".to_string(),
+        total_analyzed: patterns.len(),
+        patterns_found: patterns,
+        summary: AnalysisSummary {
+            rejection_indicators: vec![
+                "should not use".to_string(),
+                "don't use".to_string(),
+                "avoid".to_string(),
+                "instead of".to_string(),
+            ],
+            tool_preferences: vec![
+                "use Read instead".to_string(),
+                "use Edit instead".to_string(),
+            ],
+            command_families: vec![
+                "git add".to_string(),
+                "timeout".to_string(),
+                "kill/pkill".to_string(),
+            ],
+        },
+    })
+}
+
+pub fn print_analysis(result: &AnalysisResult, mode: AnalyzeMode) {
+    println!("=== DCG Pattern Analysis: {} ===", result.mode);
+    println!("Total patterns found: {}\n", result.total_analyzed);
+
+    if matches!(mode, AnalyzeMode::Full) {
+        println!("=== Summary ===");
+        println!("Rejection indicators:");
+        for indicator in &result.summary.rejection_indicators {
+            println!("  - {indicator}");
+        }
+        println!("\nTool preferences:");
+        for pref in &result.summary.tool_preferences {
+            println!("  - {pref}");
+        }
+        println!("\nCommand families:");
+        for family in &result.summary.command_families {
+            println!("  - {family}");
+        }
+        println!();
+    }
+
+    println!("=== Patterns ===");
+    for (i, pattern) in result.patterns_found.iter().take(20).enumerate() {
+        println!("[{i}] {}", pattern.pattern_type);
+        println!("    Category: {}", pattern.category);
+        println!("    Frequency: {}", pattern.frequency);
+        if let Some(regex) = &pattern.suggested_regex {
+            println!("    Suggested regex: {}", regex);
+        }
+        if let Some(expl) = &pattern.explanation {
+            println!("    Explanation: {}", expl);
+        }
+        println!("    Excerpt: {}", pattern.excerpt.chars().take(100).collect::<String>());
+        println!("    Session: {}", &pattern.session_id[..8.min(pattern.session_id.len())]);
+        println!();
+    }
+}
+
+fn categorize_rejection(content: &str) -> (String, String, Option<String>, Option<String>) {
+    let content_lower = content.to_lowercase();
+
+    // Check for specific patterns
+    if content_lower.contains("timeout") || content_lower.contains("kill") {
+        return (
+            "process-control".to_string(),
+            "timeout/kill commands".to_string(),
+            Some(r"\b(timeout|kill|pkill)\b".to_string()),
+            Some("Process manipulation interferes with AI agent control".to_string()),
+        );
+    }
+
+    if content_lower.contains("git add") {
+        return (
+            "git-staging".to_string(),
+            "git add".to_string(),
+            Some(r"git\s+add".to_string()),
+            Some("Auto-staging without review".to_string()),
+        );
+    }
+
+    if content_lower.contains("go get") && content_lower.contains("tinygo") {
+        return (
+            "dependency-management".to_string(),
+            "go get tinygo packages".to_string(),
+            Some(r"go\s+get\s+tinygo\.org/x/".to_string()),
+            Some("TinyGo packages are built-in, go get causes conflicts".to_string()),
+        );
+    }
+
+    if content_lower.contains("cat") || content_lower.contains("sed") {
+        return (
+            "stream-processing".to_string(),
+            "cat/sed commands".to_string(),
+            Some(r"\b(cat|sed)\b".to_string()),
+            Some("Use native Read/Edit tools instead".to_string()),
+        );
+    }
+
+    // Generic rejection
+    (
+        "general".to_string(),
+        "generic rejection".to_string(),
+        None,
+        None,
+    )
+}
+
+fn extract_tool_preference(content: &str) -> String {
+    let content_lower = content.to_lowercase();
+
+    if content_lower.contains("read") {
+        return "Read tool".to_string();
+    }
+    if content_lower.contains("edit") {
+        return "Edit tool".to_string();
+    }
+    if content_lower.contains("write") {
+        return "Write tool".to_string();
+    }
+    "native tool".to_string()
+}
+
+fn extract_commands(content: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+
+    // Backtick patterns
+    let re = regex::Regex::new(r"`([^`]+)`").unwrap();
+    for cap in re.captures_iter(content) {
+        if let Some(cmd) = cap.get(1) {
+            let cmd_str = cmd.as_str();
+            // Filter to actual commands
+            if cmd_str.starts_with("git ")
+                || cmd_str.starts_with("rm ")
+                || cmd_str.starts_with("cat ")
+                || cmd_str.starts_with("sed ")
+                || cmd_str.starts_with("kill")
+                || cmd_str.starts_with("timeout")
+                || cmd_str.starts_with("go get")
+            {
+                commands.push(cmd_str.to_string());
+            }
+        }
+    }
+
+    // Direct mentions
+    if content.contains("git add") {
+        commands.push("git add".to_string());
+    }
+    if content.contains("timeout") {
+        commands.push("timeout".to_string());
+    }
+
+    commands
+}
+
+fn commands_to_regex(commands: &[String]) -> String {
+    if commands.is_empty() {
+        return String::new();
+    }
+
+    let unique: std::collections::HashSet<_> = commands.iter().map(|c| c.as_str()).collect();
+
+    // Group by type
+    let git_cmds: Vec<_> = unique.iter().filter(|c| c.starts_with("git")).collect();
+    let proc_cmds: Vec<_> = unique.iter().filter(|c| **c == "timeout" || c.contains("kill")).collect();
+    let stream_cmds: Vec<_> = unique.iter().filter(|c| **c == "cat" || **c == "sed").collect();
+
+    let mut patterns = Vec::new();
+
+    if !git_cmds.is_empty() {
+        patterns.push(r"git\s+(add|commit|push)".to_string());
+    }
+    if !proc_cmds.is_empty() {
+        patterns.push(r"\b(timeout|kill|pkill)\b".to_string());
+    }
+    if !stream_cmds.is_empty() {
+        patterns.push(r"\b(cat|sed)\b".to_string());
+    }
+
+    if patterns.is_empty() {
+        r"\b[a-z]+\b".to_string()
+    } else {
+        patterns.join("|")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
